@@ -1,0 +1,60 @@
+syntax = "proto3";
+
+package lazarus.v1;
+option java_multiple_files = true;
+option java_package = "dev.lazarus.proto";
+
+service WorkflowOrchestratorService {
+  rpc StartWorkflow (StartWorkflowRequest) returns (StartWorkflowResponse);
+  rpc PollTask (PollTaskRequest) returns (PollTaskResponse);
+  rpc RecordHeartbeat (HeartbeatRequest) returns (HeartbeatResponse);
+  rpc CompleteTask (CompleteTaskRequest) returns (CompleteTaskResponse);
+}
+
+message StartWorkflowRequest {
+  string workflow_id = 1;
+  string workflow_type = 2;
+  string input_json = 3;
+}
+
+message StartWorkflowResponse {
+  string workflow_id = 1;
+  string status = 2;
+}
+
+message PollTaskRequest {
+  string worker_id = 1;
+  int32 lease_duration_seconds = 2;
+}
+
+message PollTaskResponse {
+  bool task_found = 1;
+  int64 task_id = 2;
+  string workflow_id = 3;
+  string step_key = 4;
+  string input_json = 5;
+  int32 attempt = 6;
+}
+
+message HeartbeatRequest {
+  int64 task_id = 1;
+  string worker_id = 2;
+  int32 extend_seconds = 3;
+}
+
+message HeartbeatResponse {
+  bool lease_valid = 1;
+}
+
+message CompleteTaskRequest {
+  int64 task_id = 1;
+  string workflow_id = 2;
+  string step_key = 3;
+  string worker_id = 4;
+  bool success = 5;
+  string payload_json = 6;
+}
+
+message CompleteTaskResponse {
+  bool committed = 1;
+}

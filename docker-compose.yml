@@ -1,0 +1,17 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: lazarus-postgres
+    environment:
+      POSTGRES_USER: lazarus
+      POSTGRES_PASSWORD: lazarus_password
+      POSTGRES_DB: lazarus_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./src/main/resources/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U lazarus -d lazarus_db"]
+      interval: 3s
+      timeout: 3s
+      retries: 5
