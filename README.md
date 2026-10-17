@@ -21,19 +21,19 @@ Lazarus treats the append-only event store (`workflow_events`) as the single sou
 flowchart TD
     Start([Workflow Triggered / Resumed]) --> LoadEvents[Load Completed Steps from Event Store]
     LoadEvents --> StepCall{Step Executed: ctx.step}
-    StepCall -- Cached in Event Log -- --> Replay[0ms Replay from Cache]
-    StepCall -- Not in Event Log -- --> LiveExec[Live Step Execution]
-    
+    StepCall -->|"Cached in Event Log"| Replay[0ms Replay from Cache]
+    StepCall -->|"Not in Event Log"| LiveExec[Live Step Execution]
+
     LiveExec --> AppendStarted[Append STEP_STARTED Event]
     AppendStarted --> RunCode[Execute User Lambda on Virtual Thread]
-    RunCode -- Success -- --> AppendCompleted[Append STEP_COMPLETED Event with Serialized Output]
-    RunCode -- Exception -- --> AppendFailed[Append STEP_FAILED Event]
+    RunCode -->|"Success"| AppendCompleted[Append STEP_COMPLETED Event with Serialized Output]
+    RunCode -->|"Exception"| AppendFailed[Append STEP_FAILED Event]
     AppendFailed --> Fail([Bubble Exception / Fail Step])
-    
+
     AppendCompleted --> NextStep{More Steps / DAG Branches?}
     Replay --> NextStep
-    NextStep -- Yes --> StepCall
-    NextStep -- No --> Complete([Workflow Completed])
+    NextStep -->|"Yes"| StepCall
+    NextStep -->|"No"| Complete([Workflow Completed])
 ```
 
 ---
@@ -163,4 +163,4 @@ LAZARUS/
 ---
 
 ## License
-Apache License 2.0. Built with Google Antigravity & Java 24.
+Licensed under the [Apache License, Version 2.0](LICENSE). Copyright (c) 2026 Gopichand Vallamdas.
