@@ -1,0 +1,47 @@
+name: Lazarus Java 24 CI & Benchmark
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+
+jobs:
+  test-and-benchmark:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: lazarus_db
+          POSTGRES_USER: lazarus
+          POSTGRES_PASSWORD: lazarus_password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Checkout Lazarus Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Eclipse Temurin JDK 24
+        uses: actions/setup-java@v4
+        with:
+          java-version: '24'
+          distribution: 'temurin'
+          cache: 'maven'
+
+      - name: Compile gRPC Stubs & Run JUnit 5 + Virtual Thread Benchmark Suite
+        run: mvn -B clean test -Dmaven.repo.local=.java-env/m2-repo
+
+      - name: Run Deterministic Simulation Testing (DST) Harness
+        run: mvn -B compile exec:java -Dexec.mainClass="dev.lazarus.dst.LazarusSimulationRunner"
+        env:
+          LAZARUS_DB_URL: jdbc:postgresql://localhost:5432/lazarus_db
+          LAZARUS_DB_USER: lazarus
+          LAZARUS_DB_PASS: lazarus_password

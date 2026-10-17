@@ -507,4 +507,116 @@ public class TaskQueueRepository {
         }
         return new ReapSummary(rescheduled, deadLettered);
     }
+
+    public record TaskItem(
+        long taskId,
+        String workflowId,
+        String stepKey,
+        String status,
+        int attempt,
+        int maxAttempts
+    ) {}
+
+    /**
+     * Lists recent tasks across the queue (including DEAD_LETTER tasks) for the Control Plane UI.
+     */
+    public java.util.List<TaskItem> listTasks() throws SQLException {
+        String sql = """
+            SELECT task_id, workflow_id, step_key, status, attempt, max_attempts
+            FROM workflow_tasks
+            ORDER BY task_id DESC
+            LIMIT 30
+            """;
+        java.util.List<TaskItem> tasks = new java.util.ArrayList<>();
+        try (Connection conn = dataSource.getConnection();
+             PreparedStatement ps = conn.prepareStatement(sql);
+             ResultSet rs = ps.executeQuery()) {
+            while (rs.next()) {
+                tasks.add(new TaskItem(
+                    rs.getLong("task_id"),
+                    rs.getString("workflow_id"),
+                    rs.getString("step_key"),
+                    rs.getString("status"),
+                    rs.getInt("attempt"),
+                    rs.getInt("max_attempts")
+                ));
+            }
+        }
+        return tasks;
+    }
+
+    /**
+     * Seeds a simulated exhausted task directly into DEAD_LETTER state for Control Plane testing.
+     */
+    public void seedDeadLetterTask(String workflowId, String stepKey) throws SQLException {
+        if (isH2) {
+            String updateSql = """
+                UPDATE workflow_tasks
+                SET status = 'DEAD_LETTER', attempt = 5, worker_id = NULL, lease_expires_at = NULL, next_run_at = NOW()
+                WHERE workflow_id = ? AND step_key = ?
+                """;
+            String insertSql = """
+                INSERT INTO workflow_tasks (workflow_id, step_key, status, attempt, max_attempts, next_run_at)
+                SELECT ?, ?, 'DEAD_LETTER', 5, 5, NOW()
+                WHERE NOT EXISTS (SELECT 1 FROM workflow_tasks WHERE workflow_id = ? AND step_key = ?)
+                """;
+            try (Connection conn = dataSource.getConnection()) {
+                conn.setAutoCommit(false);
+                try {
+                    int updated;
+                    try (PreparedStatement ps = conn.prepareStatement(updateSql)) {
+                        ps.setString(1, workflowId);
+                        ps.setString(2, stepKey);
+                        updated = ps.executeUpdate();
+                    }
+                    if (updated == 0) {
+                        try (PreparedStatement ps = conn.prepareStatement(insertSql)) {
+                            ps.setString(1, workflowId);
+                            ps.setString(2, stepKey);
+                            ps.setString(3, workflowId);
+                            ps.setString(4, stepKey);
+                            ps.executeUpdate();
+                        }
+                    }
+                    conn.commit();
+                    return;
+                } catch (SQLException ex) {
+                    conn.rollback();
+                    throw ex;
+                }
+            }
+        }
+
+        String sql = """
+            INSERT INTO workflow_tasks (workflow_id, step_key, status, attempt, max_attempts, next_run_at)
+            VALUES (?, ?, 'DEAD_LETTER', 5, 5, NOW())
+            ON CONFLICT (workflow_id, step_key)
+            DO UPDATE SET status = 'DEAD_LETTER', attempt = 5, worker_id = NULL, lease_expires_at = NULL
+            """;
+        try (Connection conn = dataSource.getConnection();
+             PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setString(1, workflowId);
+            ps.setString(2, stepKey);
+            ps.executeUpdate();
+        }
+    }
+
+    /**
+     * Resets all DEAD_LETTER tasks back to PENDING with attempt = 0 for immediate re-execution.
+     */
+    public int replayDeadLetterTasks() throws SQLException {
+        String sql = """
+            UPDATE workflow_tasks
+            SET status = 'PENDING',
+                attempt = 0,
+                worker_id = NULL,
+                lease_expires_at = NULL,
+                next_run_at = NOW()
+            WHERE status = 'DEAD_LETTER'
+            """;
+        try (Connection conn = dataSource.getConnection();
+             PreparedStatement ps = conn.prepareStatement(sql)) {
+            return ps.executeUpdate();
+        }
+    }
 }

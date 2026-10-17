@@ -173,4 +173,19 @@ class LazarusEngineTest {
                 execMs, replayMs);
         assertTrue(replayMs < execMs, "Cached deterministic replay should be faster than live step persistence");
     }
+
+    @Test
+    @DisplayName("4. Dead-Letter Queue (DLQ) Replay: Resets exhausted tasks to PENDING with attempt=0")
+    void testDeadLetterQueueReplay() throws Exception {
+        String wfId = "test-dlq-" + UUID.randomUUID();
+        eventStore.createWorkflowInstance(wfId, "dlq-recovery", "{}");
+        taskQueue.seedDeadLetterTask(wfId, "step-poison-pill");
+
+        int replayed = taskQueue.replayDeadLetterTasks();
+        assertTrue(replayed >= 1, "Should replay at least 1 dead-lettered task");
+
+        Optional<ClaimedTask> claimed = taskQueue.pollNextTask("worker-dlq-recovery", 15);
+        assertTrue(claimed.isPresent(), "Replayed DLQ task must be immediately claimable by a worker");
+        assertEquals(1, claimed.get().attempt(), "Attempt counter must reset to 1 upon new claim");
+    }
 }
