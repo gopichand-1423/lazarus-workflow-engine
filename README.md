@@ -1,5 +1,6 @@
 # Lazarus — Distributed Durable Workflow Engine (Java 24)
 
+[![CI Status](https://github.com/gopichand-1423/lazarus-workflow-engine/actions/workflows/ci.yml/badge.svg)](https://github.com/gopichand-1423/lazarus-workflow-engine/actions)
 [![Java](https://img.shields.io/badge/Java-24-orange.svg)](https://openjdk.org/projects/jdk/24/)
 [![Virtual Threads](https://img.shields.io/badge/JEP-491%20Virtual%20Threads-blue.svg)](https://openjdk.org/jeps/491)
 [![Database](https://img.shields.io/badge/Database-PostgreSQL%20%7C%20H2-336791.svg)](https://www.postgresql.org/)
