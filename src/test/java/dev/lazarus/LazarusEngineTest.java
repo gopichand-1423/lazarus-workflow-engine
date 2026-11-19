@@ -189,7 +189,8 @@ class LazarusEngineTest {
         markLeaseExpired(claim.taskId());
 
         assertFalse(taskQueue.completeTask(
-                claim.taskId(), wfId, "step-expired", "worker-expired", claim.fencingToken(), true, "{}"));
+                claim.taskId(), wfId, "step-expired", "worker-expired", claim.fencingToken(),
+                true, false, "{}", List.of("step-expired")));
         assertEquals(0, countEvents(wfId, "step-expired", "STEP_COMPLETED"));
         taskQueue.reapZombieTasks(10);
     }
@@ -216,10 +217,12 @@ class LazarusEngineTest {
                 secondClaim.taskId(), workerId, secondClaim.fencingToken(), 30));
 
         assertFalse(taskQueue.completeTask(
-                firstClaim.taskId(), wfId, "step-reclaimed", workerId, firstClaim.fencingToken(), true, "{\"old\":true}"));
+                firstClaim.taskId(), wfId, "step-reclaimed", workerId, firstClaim.fencingToken(),
+                true, false, "{\"old\":true}", List.of("step-reclaimed")));
         assertEquals(0, countEvents(wfId, "step-reclaimed", "STEP_COMPLETED"));
         assertTrue(taskQueue.completeTask(
-                secondClaim.taskId(), wfId, "step-reclaimed", workerId, secondClaim.fencingToken(), true, "{\"new\":true}"));
+                secondClaim.taskId(), wfId, "step-reclaimed", workerId, secondClaim.fencingToken(),
+                true, false, "{\"new\":true}", List.of("step-reclaimed")));
         assertEquals(1, countEvents(wfId, "step-reclaimed", "STEP_COMPLETED"));
     }
 
@@ -234,14 +237,17 @@ class LazarusEngineTest {
         ClaimedTask claim = taskQueue.pollNextTask("worker-identity", 30).orElseThrow();
 
         assertFalse(taskQueue.completeTask(
-                claim.taskId(), otherWfId, "step-identity", "worker-identity", claim.fencingToken(), true, "{}"));
+                claim.taskId(), otherWfId, "step-identity", "worker-identity", claim.fencingToken(),
+                true, false, "{}", List.of("step-identity")));
         assertFalse(taskQueue.completeTask(
-                claim.taskId(), wfId, "different-step", "worker-identity", claim.fencingToken(), true, "{}"));
+                claim.taskId(), wfId, "different-step", "worker-identity", claim.fencingToken(),
+                true, false, "{}", List.of("step-identity")));
         assertEquals(0, countEvents(wfId, "step-identity", "STEP_COMPLETED"));
         assertEquals(0, countEvents(otherWfId, "step-identity", "STEP_COMPLETED"));
 
         assertTrue(taskQueue.completeTask(
-                claim.taskId(), wfId, "step-identity", "worker-identity", claim.fencingToken(), true, "{}"));
+                claim.taskId(), wfId, "step-identity", "worker-identity", claim.fencingToken(),
+                true, false, "{}", List.of("step-identity")));
         assertEquals(1, countEvents(wfId, "step-identity", "STEP_COMPLETED"));
     }
 

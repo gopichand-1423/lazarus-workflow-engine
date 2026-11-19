@@ -1,7 +1,10 @@
 package dev.lazarus.grpc;
 
 import dev.lazarus.proto.*;
+import dev.lazarus.engine.WorkflowDefinitionRegistry;
+import dev.lazarus.engine.WorkflowDefinitionRegistry.WorkflowDefinition;
 import dev.lazarus.store.EventStoreRepository;
+import dev.lazarus.store.EventStoreRepository.WorkflowInstance;
 import dev.lazarus.store.TaskQueueRepository;
 import dev.lazarus.store.TaskQueueRepository.ClaimedTask;
 import io.grpc.Status;
@@ -13,28 +16,58 @@ public class WorkflowOrchestratorServiceImpl extends WorkflowOrchestratorService
 
     private final EventStoreRepository eventStore;
     private final TaskQueueRepository taskQueue;
+    private final WorkflowDefinitionRegistry workflowDefinitions;
 
-    public WorkflowOrchestratorServiceImpl(EventStoreRepository eventStore, TaskQueueRepository taskQueue) {
+    public WorkflowOrchestratorServiceImpl(
+            EventStoreRepository eventStore,
+            TaskQueueRepository taskQueue,
+            WorkflowDefinitionRegistry workflowDefinitions
+    ) {
         this.eventStore = eventStore;
         this.taskQueue = taskQueue;
+        this.workflowDefinitions = workflowDefinitions;
     }
 
     @Override
     public void startWorkflow(StartWorkflowRequest request, StreamObserver<StartWorkflowResponse> responseObserver) {
         try {
+            WorkflowDefinition definition = workflowDefinitions.find(request.getWorkflowType()).orElse(null);
+            if (definition == null) {
+                responseObserver.onError(Status.INVALID_ARGUMENT
+                        .withDescription("Unknown workflow type: " + request.getWorkflowType())
+                        .asRuntimeException());
+                return;
+            }
+            if (request.getWorkflowId().isBlank()) {
+                responseObserver.onError(Status.INVALID_ARGUMENT
+                        .withDescription("workflow_id must not be blank")
+                        .asRuntimeException());
+                return;
+            }
+
             boolean created = eventStore.createWorkflowInstance(
                     request.getWorkflowId(),
                     request.getWorkflowType(),
                     request.getInputJson()
             );
-            // Enqueue the entry step for the workflow
+            String status = "RUNNING";
             if (created) {
-                taskQueue.enqueueTask(request.getWorkflowId(), "step-1-init", 5);
+                taskQueue.enqueueTask(request.getWorkflowId(), definition.stepKeys().getFirst(), 5);
+            } else {
+                WorkflowInstance existing = eventStore.loadWorkflowInstance(request.getWorkflowId())
+                        .orElseThrow(() -> new IllegalStateException("Workflow instance disappeared after create"));
+                if (!existing.workflowType().equals(request.getWorkflowType())) {
+                    responseObserver.onError(Status.INVALID_ARGUMENT
+                            .withDescription("workflow_id is already registered with type " + existing.workflowType())
+                            .asRuntimeException());
+                    return;
+                }
+                status = existing.status();
             }
 
             StartWorkflowResponse response = StartWorkflowResponse.newBuilder()
                     .setWorkflowId(request.getWorkflowId())
-                    .setStatus("RUNNING")
+                    .setStatus(status)
                     .build();
             responseObserver.onNext(response);
             responseObserver.onCompleted();
@@ -90,6 +123,21 @@ public class WorkflowOrchestratorServiceImpl extends WorkflowOrchestratorService
     @Override
     public void completeTask(CompleteTaskRequest request, StreamObserver<CompleteTaskResponse> responseObserver) {
         try {
+            WorkflowInstance workflow = eventStore.loadWorkflowInstance(request.getWorkflowId()).orElse(null);
+            if (workflow == null) {
+                responseObserver.onError(Status.NOT_FOUND
+                        .withDescription("Workflow not found: " + request.getWorkflowId())
+                        .asRuntimeException());
+                return;
+            }
+            WorkflowDefinition definition = workflowDefinitions.find(workflow.workflowType()).orElse(null);
+            if (definition == null) {
+                responseObserver.onError(Status.FAILED_PRECONDITION
+                        .withDescription("Workflow definition is no longer registered: " + workflow.workflowType())
+                        .asRuntimeException());
+                return;
+            }
+
             boolean committed = taskQueue.completeTask(
                     request.getTaskId(),
                     request.getWorkflowId(),
@@ -97,13 +145,15 @@ public class WorkflowOrchestratorServiceImpl extends WorkflowOrchestratorService
                     request.getWorkerId(),
                     request.getFencingToken(),
                     request.getSuccess(),
-                    request.getPayloadJson()
+                    request.getRetryable(),
+                    request.getPayloadJson(),
+                    definition.stepKeys()
             );
 
             CompleteTaskResponse.Builder responseBuilder = CompleteTaskResponse.newBuilder()
                     .setCommitted(committed);
             if (!committed) {
-                responseBuilder.setRejectionReason("STALE_LEASE_OR_FENCING_TOKEN");
+                responseBuilder.setRejectionReason("STALE_LEASE_OR_FENCING_TOKEN_OR_WORKFLOW_STATE");
             }
             CompleteTaskResponse response = responseBuilder.build();
             responseObserver.onNext(response);

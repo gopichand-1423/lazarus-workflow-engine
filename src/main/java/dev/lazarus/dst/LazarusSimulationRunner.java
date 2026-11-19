@@ -12,6 +12,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.sql.Connection;
 import java.sql.Statement;
+import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -110,13 +111,13 @@ public class LazarusSimulationRunner {
         ClaimedTask claimB = taskQueue.pollNextTask("worker-B-healthy", 10).orElseThrow();
         boolean committedB = taskQueue.completeTask(
                 claimB.taskId(), wfId, "debit-account", "worker-B-healthy", claimB.fencingToken(),
-                true, "{\"txId\":\"TX-900\"}");
+                true, false, "{\"txId\":\"TX-900\"}", List.of("debit-account"));
         System.out.printf("3. Worker-B claimed taskId=%d (attempt=%d) and committed -> success=%b%n",
                 claimB.taskId(), claimB.attempt(), committedB);
 
         boolean committedA = taskQueue.completeTask(
                 claimA.taskId(), wfId, "debit-account", "worker-A-zombie", claimA.fencingToken(),
-                true, "{\"txId\":\"DUPLICATE-TX\"}");
+                true, false, "{\"txId\":\"DUPLICATE-TX\"}", List.of("debit-account"));
         System.out.printf("4. Zombie Worker-A attempted stale commit -> committed=%b (MUST BE FALSE)%n", committedA);
 
         if (committedA || !committedB) {

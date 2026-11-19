@@ -16,7 +16,7 @@ CREATE TABLE workflow_events (
     workflow_id VARCHAR(128) NOT NULL REFERENCES workflow_instances(workflow_id),
     sequence_num BIGINT NOT NULL,
     step_key VARCHAR(128) NOT NULL,
-    event_type VARCHAR(64) NOT NULL, -- WORKFLOW_STARTED, STEP_STARTED, STEP_COMPLETED, STEP_FAILED
+    event_type VARCHAR(64) NOT NULL, -- WORKFLOW_STARTED, STEP_STARTED, STEP_COMPLETED, STEP_FAILED, WORKFLOW_COMPLETED, WORKFLOW_FAILED
     payload JSONB,
     created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
     UNIQUE (workflow_id, sequence_num)

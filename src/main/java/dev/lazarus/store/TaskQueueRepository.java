@@ -2,6 +2,7 @@ package dev.lazarus.store;
 
 import javax.sql.DataSource;
 import java.sql.*;
+import java.util.List;
 import java.util.Optional;
 
 public class TaskQueueRepository {
@@ -16,6 +17,8 @@ public class TaskQueueRepository {
     ) {}
 
     public record ReapSummary(int rescheduledCount, int deadLetteredCount) {}
+
+    private record ExpiredTask(long taskId, int attempt, int maxAttempts, String workflowId, String stepKey) {}
 
     private final DataSource dataSource;
     private final boolean isH2;
@@ -225,7 +228,7 @@ public class TaskQueueRepository {
     }
 
     /**
-     * Commits task completion or schedules exponential backoff retry atomically with event log append.
+     * Commits task completion, workflow progression, and event log writes in one transaction.
      * Rejects stale claim tokens, mismatched task identities, and expired leases.
      */
     public boolean completeTask(
@@ -235,8 +238,16 @@ public class TaskQueueRepository {
             String workerId,
             long fencingToken,
             boolean success,
-            String payloadJson
+            boolean retryable,
+            String payloadJson,
+            List<String> workflowStepKeys
     ) throws SQLException {
+        int stepIndex = workflowStepKeys.indexOf(stepKey);
+        if (stepIndex < 0) {
+            return false;
+        }
+        String nextStepKey = stepIndex + 1 < workflowStepKeys.size() ? workflowStepKeys.get(stepIndex + 1) : null;
+
         String taskUpdateSql;
         if (isH2) {
             taskUpdateSql = success ? """
@@ -251,7 +262,7 @@ public class TaskQueueRepository {
                   AND lease_expires_at > NOW()
                 """ : """
                 UPDATE workflow_tasks
-                SET status = CASE WHEN attempt >= max_attempts THEN 'DEAD_LETTER' ELSE 'PENDING' END,
+                SET status = CASE WHEN attempt >= max_attempts OR ? = FALSE THEN 'DEAD_LETTER' ELSE 'PENDING' END,
                     worker_id = NULL,
                     lease_expires_at = NULL,
                     next_run_at = DATEADD('SECOND', POWER(2, attempt), NOW())
@@ -276,7 +287,7 @@ public class TaskQueueRepository {
                   AND lease_expires_at > clock_timestamp()
                 """ : """
                 UPDATE workflow_tasks
-                SET status = CASE WHEN attempt >= max_attempts THEN 'DEAD_LETTER' ELSE 'PENDING' END,
+                SET status = CASE WHEN attempt >= max_attempts OR ? = FALSE THEN 'DEAD_LETTER' ELSE 'PENDING' END,
                     worker_id = NULL,
                     lease_expires_at = NULL,
                     next_run_at = NOW() + (POWER(2, attempt) * INTERVAL '1 second')
@@ -290,73 +301,44 @@ public class TaskQueueRepository {
                 """;
         }
 
-        String selectVersionSql = "SELECT current_version FROM workflow_instances WHERE workflow_id = ? FOR UPDATE";
-        String updateVersionSql = "UPDATE workflow_instances SET current_version = current_version + 1, updated_at = NOW() WHERE workflow_id = ?";
-        String bumpVersionSql = """
-            UPDATE workflow_instances
-            SET current_version = current_version + 1, updated_at = NOW()
-            WHERE workflow_id = ?
-            RETURNING current_version
-            """;
-        String insertEventSql = isH2 ? """
-            INSERT INTO workflow_events (workflow_id, sequence_num, step_key, event_type, payload)
-            VALUES (?, ?, ?, ?, ?)
-            """ : """
-            INSERT INTO workflow_events (workflow_id, sequence_num, step_key, event_type, payload)
-            VALUES (?, ?, ?, ?, ?::jsonb)
-            """;
-
         try (Connection conn = dataSource.getConnection()) {
             conn.setAutoCommit(false);
             try {
                 // The lease check and task transition are one conditional update. A rejected claim
                 // cannot append an event because the event write is in this same transaction.
                 try (PreparedStatement taskPs = conn.prepareStatement(taskUpdateSql)) {
-                    taskPs.setLong(1, taskId);
-                    taskPs.setString(2, workerId);
-                    taskPs.setLong(3, fencingToken);
-                    taskPs.setString(4, workflowId);
-                    taskPs.setString(5, stepKey);
+                    int parameter = 1;
+                    if (!success) {
+                        taskPs.setBoolean(parameter++, retryable);
+                    }
+                    taskPs.setLong(parameter++, taskId);
+                    taskPs.setString(parameter++, workerId);
+                    taskPs.setLong(parameter++, fencingToken);
+                    taskPs.setString(parameter++, workflowId);
+                    taskPs.setString(parameter, stepKey);
                     if (taskPs.executeUpdate() != 1) {
                         conn.rollback();
                         return false;
                     }
                 }
 
-                long nextSeq;
-                if (isH2) {
-                    try (PreparedStatement selPs = conn.prepareStatement(selectVersionSql);
-                         PreparedStatement updPs = conn.prepareStatement(updateVersionSql)) {
-                        selPs.setString(1, workflowId);
-                        try (ResultSet rs = selPs.executeQuery()) {
-                            if (!rs.next()) {
-                                throw new IllegalStateException("Workflow instance missing: " + workflowId);
-                            }
-                            nextSeq = rs.getLong(1) + 1;
-                        }
-                        updPs.setString(1, workflowId);
-                        updPs.executeUpdate();
-                    }
-                } else {
-                    try (PreparedStatement bumpPs = conn.prepareStatement(bumpVersionSql)) {
-                        bumpPs.setString(1, workflowId);
-                        try (ResultSet rs = bumpPs.executeQuery()) {
-                            if (!rs.next()) {
-                                throw new IllegalStateException("Workflow instance missing: " + workflowId);
-                            }
-                            nextSeq = rs.getLong(1);
-                        }
-                    }
-                }
-
                 String eventType = success ? "STEP_COMPLETED" : "STEP_FAILED";
-                try (PreparedStatement eventPs = conn.prepareStatement(insertEventSql)) {
-                    eventPs.setString(1, workflowId);
-                    eventPs.setLong(2, nextSeq);
-                    eventPs.setString(3, stepKey);
-                    eventPs.setString(4, eventType);
-                    eventPs.setString(5, payloadJson);
-                    eventPs.executeUpdate();
+                appendEventInTransaction(conn, workflowId, stepKey, eventType, payloadJson);
+
+                if (success && nextStepKey != null) {
+                    enqueueTaskInTransaction(conn, workflowId, nextStepKey, 5);
+                } else if (success) {
+                    if (!updateWorkflowTerminalInTransaction(conn, workflowId, "COMPLETED", payloadJson)) {
+                        conn.rollback();
+                        return false;
+                    }
+                    appendEventInTransaction(conn, workflowId, "__workflow__", "WORKFLOW_COMPLETED", payloadJson);
+                } else if (isTaskDeadLettered(conn, taskId)) {
+                    if (!updateWorkflowTerminalInTransaction(conn, workflowId, "FAILED", payloadJson)) {
+                        conn.rollback();
+                        return false;
+                    }
+                    appendEventInTransaction(conn, workflowId, "__workflow__", "WORKFLOW_FAILED", payloadJson);
                 }
 
                 conn.commit();
@@ -364,6 +346,121 @@ public class TaskQueueRepository {
             } catch (SQLException ex) {
                 conn.rollback();
                 throw ex;
+            }
+        }
+    }
+
+    private void enqueueTaskInTransaction(Connection conn, String workflowId, String stepKey, int maxAttempts) throws SQLException {
+        String sql = isH2 ? """
+            INSERT INTO workflow_tasks (workflow_id, step_key, status, max_attempts, next_run_at)
+            SELECT ?, ?, 'PENDING', ?, NOW()
+            WHERE NOT EXISTS (SELECT 1 FROM workflow_tasks WHERE workflow_id = ? AND step_key = ?)
+            """ : """
+            INSERT INTO workflow_tasks (workflow_id, step_key, status, max_attempts, next_run_at)
+            VALUES (?, ?, 'PENDING', ?, NOW())
+            ON CONFLICT (workflow_id, step_key) DO NOTHING
+            """;
+        try (PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setString(1, workflowId);
+            ps.setString(2, stepKey);
+            ps.setInt(3, maxAttempts);
+            if (isH2) {
+                ps.setString(4, workflowId);
+                ps.setString(5, stepKey);
+            }
+            ps.executeUpdate();
+        }
+    }
+
+    private void appendEventInTransaction(
+            Connection conn,
+            String workflowId,
+            String stepKey,
+            String eventType,
+            String payloadJson
+    ) throws SQLException {
+        long sequence;
+        if (isH2) {
+            try (PreparedStatement ps = conn.prepareStatement(
+                    "SELECT current_version FROM workflow_instances WHERE workflow_id = ? FOR UPDATE")) {
+                ps.setString(1, workflowId);
+                try (ResultSet rs = ps.executeQuery()) {
+                    if (!rs.next()) {
+                        throw new IllegalStateException("Workflow instance missing: " + workflowId);
+                    }
+                    sequence = rs.getLong(1) + 1;
+                }
+            }
+            try (PreparedStatement ps = conn.prepareStatement("""
+                    UPDATE workflow_instances
+                    SET current_version = current_version + 1, updated_at = NOW()
+                    WHERE workflow_id = ?
+                    """)) {
+                ps.setString(1, workflowId);
+                ps.executeUpdate();
+            }
+        } else {
+            try (PreparedStatement ps = conn.prepareStatement("""
+                    UPDATE workflow_instances
+                    SET current_version = current_version + 1, updated_at = NOW()
+                    WHERE workflow_id = ?
+                    RETURNING current_version
+                    """)) {
+                ps.setString(1, workflowId);
+                try (ResultSet rs = ps.executeQuery()) {
+                    if (!rs.next()) {
+                        throw new IllegalStateException("Workflow instance missing: " + workflowId);
+                    }
+                    sequence = rs.getLong(1);
+                }
+            }
+        }
+
+        String sql = isH2 ? """
+            INSERT INTO workflow_events (workflow_id, sequence_num, step_key, event_type, payload)
+            VALUES (?, ?, ?, ?, ?)
+            """ : """
+            INSERT INTO workflow_events (workflow_id, sequence_num, step_key, event_type, payload)
+            VALUES (?, ?, ?, ?, ?::jsonb)
+            """;
+        try (PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setString(1, workflowId);
+            ps.setLong(2, sequence);
+            ps.setString(3, stepKey);
+            ps.setString(4, eventType);
+            ps.setString(5, payloadJson);
+            ps.executeUpdate();
+        }
+    }
+
+    private boolean updateWorkflowTerminalInTransaction(
+            Connection conn,
+            String workflowId,
+            String status,
+            String payloadJson
+    ) throws SQLException {
+        String sql = isH2 ? """
+            UPDATE workflow_instances
+            SET status = ?, output_payload = ? FORMAT JSON, updated_at = NOW()
+            WHERE workflow_id = ? AND status = 'RUNNING'
+            """ : """
+            UPDATE workflow_instances
+            SET status = ?, output_payload = ?::jsonb, updated_at = NOW()
+            WHERE workflow_id = ? AND status = 'RUNNING'
+            """;
+        try (PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setString(1, status);
+            ps.setString(2, payloadJson);
+            ps.setString(3, workflowId);
+            return ps.executeUpdate() == 1;
+        }
+    }
+
+    private boolean isTaskDeadLettered(Connection conn, long taskId) throws SQLException {
+        try (PreparedStatement ps = conn.prepareStatement("SELECT status FROM workflow_tasks WHERE task_id = ?")) {
+            ps.setLong(1, taskId);
+            try (ResultSet rs = ps.executeQuery()) {
+                return rs.next() && "DEAD_LETTER".equals(rs.getString(1));
             }
         }
     }
@@ -376,7 +473,7 @@ public class TaskQueueRepository {
     public ReapSummary reapZombieTasks(int batchSize) throws SQLException {
         if (isH2) {
             String selectExpired = """
-                SELECT task_id, attempt, max_attempts
+                SELECT task_id, attempt, max_attempts, workflow_id, step_key
                 FROM workflow_tasks
                 WHERE status = 'IN_PROGRESS'
                   AND lease_expires_at < NOW()
@@ -402,29 +499,32 @@ public class TaskQueueRepository {
             try (Connection conn = dataSource.getConnection()) {
                 conn.setAutoCommit(false);
                 try {
-                    java.util.List<long[]> expiredList = new java.util.ArrayList<>();
+                    List<ExpiredTask> expiredList = new java.util.ArrayList<>();
                     try (PreparedStatement ps = conn.prepareStatement(selectExpired)) {
                         ps.setInt(1, batchSize);
                         try (ResultSet rs = ps.executeQuery()) {
                             while (rs.next()) {
-                                expiredList.add(new long[]{rs.getLong("task_id"), rs.getInt("attempt"), rs.getInt("max_attempts")});
+                                expiredList.add(new ExpiredTask(
+                                        rs.getLong("task_id"),
+                                        rs.getInt("attempt"),
+                                        rs.getInt("max_attempts"),
+                                        rs.getString("workflow_id"),
+                                        rs.getString("step_key")));
                             }
                         }
                     }
 
-                    for (long[] item : expiredList) {
-                        long tid = item[0];
-                        long att = item[1];
-                        long maxAtt = item[2];
-                        if (att >= maxAtt) {
+                    for (ExpiredTask item : expiredList) {
+                        if (item.attempt() >= item.maxAttempts()) {
                             try (PreparedStatement ps = conn.prepareStatement(markDeadLetter)) {
-                                ps.setLong(1, tid);
+                                ps.setLong(1, item.taskId());
                                 ps.executeUpdate();
                             }
+                            markWorkflowFailedForExpiredTask(conn, item.workflowId(), item.stepKey(), item.attempt());
                             deadLettered++;
                         } else {
                             try (PreparedStatement ps = conn.prepareStatement(rescheduleTask)) {
-                                ps.setLong(1, tid);
+                                ps.setLong(1, item.taskId());
                                 ps.executeUpdate();
                             }
                             rescheduled++;
@@ -459,27 +559,53 @@ public class TaskQueueRepository {
                 END
             FROM expired e
             WHERE wt.task_id = e.task_id
-            RETURNING wt.status
+            RETURNING wt.status, wt.workflow_id, wt.step_key, wt.attempt
             """;
 
         int rescheduled = 0;
         int deadLettered = 0;
 
-        try (Connection conn = dataSource.getConnection();
-             PreparedStatement ps = conn.prepareStatement(reapSql)) {
-            ps.setInt(1, batchSize);
-            try (ResultSet rs = ps.executeQuery()) {
-                while (rs.next()) {
-                    String newStatus = rs.getString("status");
-                    if ("DEAD_LETTER".equals(newStatus)) {
-                        deadLettered++;
-                    } else {
-                        rescheduled++;
+        try (Connection conn = dataSource.getConnection()) {
+            conn.setAutoCommit(false);
+            try {
+                try (PreparedStatement ps = conn.prepareStatement(reapSql)) {
+                    ps.setInt(1, batchSize);
+                    try (ResultSet rs = ps.executeQuery()) {
+                        while (rs.next()) {
+                            String newStatus = rs.getString("status");
+                            if ("DEAD_LETTER".equals(newStatus)) {
+                                markWorkflowFailedForExpiredTask(
+                                        conn,
+                                        rs.getString("workflow_id"),
+                                        rs.getString("step_key"),
+                                        rs.getInt("attempt"));
+                                deadLettered++;
+                            } else {
+                                rescheduled++;
+                            }
+                        }
                     }
                 }
+                conn.commit();
+            } catch (SQLException ex) {
+                conn.rollback();
+                throw ex;
             }
         }
         return new ReapSummary(rescheduled, deadLettered);
+    }
+
+    private void markWorkflowFailedForExpiredTask(
+            Connection conn,
+            String workflowId,
+            String stepKey,
+            int attempt
+    ) throws SQLException {
+        String reasonJson = "{\"error\":\"LEASE_ATTEMPTS_EXHAUSTED\",\"attempt\":" + attempt + "}";
+        if (updateWorkflowTerminalInTransaction(conn, workflowId, "FAILED", reasonJson)) {
+            appendEventInTransaction(conn, workflowId, stepKey, "STEP_FAILED", reasonJson);
+            appendEventInTransaction(conn, workflowId, "__workflow__", "WORKFLOW_FAILED", reasonJson);
+        }
     }
 
     public record TaskItem(

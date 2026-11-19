@@ -18,6 +18,13 @@ public class EventStoreRepository {
         Instant createdAt
     ) {}
 
+    public record WorkflowInstance(
+        String workflowId,
+        String workflowType,
+        String status,
+        String outputPayloadJson
+    ) {}
+
     private final DataSource dataSource;
     private final boolean isH2;
 
@@ -114,6 +121,31 @@ public class EventStoreRepository {
             } catch (SQLException ex) {
                 conn.rollback();
                 throw ex;
+            }
+        }
+    }
+
+    public java.util.Optional<WorkflowInstance> loadWorkflowInstance(String workflowId) throws SQLException {
+        String sql = isH2 ? """
+            SELECT workflow_id, workflow_type, status, output_payload
+            FROM workflow_instances
+            WHERE workflow_id = ?
+            """ : """
+            SELECT workflow_id, workflow_type, status, output_payload::text AS output_payload
+            FROM workflow_instances
+            WHERE workflow_id = ?
+            """;
+        try (Connection conn = dataSource.getConnection(); PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setString(1, workflowId);
+            try (ResultSet rs = ps.executeQuery()) {
+                if (!rs.next()) {
+                    return java.util.Optional.empty();
+                }
+                return java.util.Optional.of(new WorkflowInstance(
+                        rs.getString("workflow_id"),
+                        rs.getString("workflow_type"),
+                        rs.getString("status"),
+                        rs.getString("output_payload")));
             }
         }
     }

@@ -2,17 +2,18 @@ package dev.lazarus.engine;
 
 import dev.lazarus.store.TaskQueueRepository;
 import dev.lazarus.store.TaskQueueRepository.ReapSummary;
+import org.springframework.context.SmartLifecycle;
 
 import java.time.Duration;
 import java.util.concurrent.atomic.AtomicBoolean;
 
-public class ZombieWorkerReaper implements AutoCloseable {
+public class ZombieWorkerReaper implements SmartLifecycle, AutoCloseable {
 
     private final TaskQueueRepository taskQueueRepository;
     private final Duration sweepInterval;
     private final int batchSize;
     private final AtomicBoolean running = new AtomicBoolean(false);
-    private Thread reaperVirtualThread;
+    private volatile Thread reaperVirtualThread;
 
     public ZombieWorkerReaper(TaskQueueRepository taskQueueRepository, Duration sweepInterval, int batchSize) {
         this.taskQueueRepository = taskQueueRepository;
@@ -27,6 +28,21 @@ public class ZombieWorkerReaper implements AutoCloseable {
         reaperVirtualThread = Thread.ofVirtual()
                 .name("lazarus-zombie-reaper")
                 .start(this::reapLoop);
+    }
+
+    @Override
+    public boolean isRunning() {
+        return running.get();
+    }
+
+    @Override
+    public boolean isAutoStartup() {
+        return true;
+    }
+
+    @Override
+    public int getPhase() {
+        return 0;
     }
 
     private void reapLoop() {
@@ -49,10 +65,30 @@ public class ZombieWorkerReaper implements AutoCloseable {
     }
 
     @Override
-    public void close() {
+    public void stop() {
         running.set(false);
-        if (reaperVirtualThread != null) {
-            reaperVirtualThread.interrupt();
+        Thread thread = reaperVirtualThread;
+        if (thread != null) {
+            thread.interrupt();
+            try {
+                thread.join(5000);
+            } catch (InterruptedException ex) {
+                Thread.currentThread().interrupt();
+            }
         }
+    }
+
+    @Override
+    public void stop(Runnable callback) {
+        try {
+            stop();
+        } finally {
+            callback.run();
+        }
+    }
+
+    @Override
+    public void close() {
+        stop();
     }
 }

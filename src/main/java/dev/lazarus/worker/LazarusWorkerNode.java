@@ -70,10 +70,10 @@ public class LazarusWorkerNode implements AutoCloseable {
         AtomicBoolean fencedOff = new AtomicBoolean(false);
 
         Callable<String> work = () -> {
-            Function<String, String> handler = stepHandlers.getOrDefault(
-                    task.getStepKey(),
-                    input -> "{\"status\":\"executed\",\"step\":\"" + task.getStepKey() + "\"}"
-            );
+            Function<String, String> handler = stepHandlers.get(task.getStepKey());
+            if (handler == null) {
+                throw new IllegalArgumentException("No worker handler registered for step key: " + task.getStepKey());
+            }
             return handler.apply(task.getInputJson());
         };
 
@@ -137,7 +137,11 @@ public class LazarusWorkerNode implements AutoCloseable {
             heartbeatThread.interrupt();
 
             if (!fencedOff.get()) {
-                String errorJson = "{\"error\":\"" + ex.getMessage().replace("\"", "'") + "\"}";
+                Throwable failure = ex instanceof java.util.concurrent.ExecutionException && ex.getCause() != null
+                        ? ex.getCause()
+                        : ex;
+                String errorMessage = failure.getMessage() == null ? failure.getClass().getSimpleName() : failure.getMessage();
+                String errorJson = "{\"error\":\"" + errorMessage.replace("\"", "'") + "\"}";
                 CompleteTaskResponse completion = stub.completeTask(CompleteTaskRequest.newBuilder()
                         .setTaskId(task.getTaskId())
                         .setWorkflowId(task.getWorkflowId())
@@ -146,6 +150,7 @@ public class LazarusWorkerNode implements AutoCloseable {
                         .setSuccess(false)
                         .setPayloadJson(errorJson)
                         .setFencingToken(task.getFencingToken())
+                        .setRetryable(!(failure instanceof IllegalArgumentException))
                         .build());
                 if (!completion.getCommitted()) {
                     System.err.printf("[FENCED] Failure report rejected for task %d: %s%n",
