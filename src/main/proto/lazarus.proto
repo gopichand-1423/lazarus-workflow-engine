@@ -35,6 +35,8 @@ message PollTaskResponse {
   string input_json = 5;
   int32 attempt = 6;
   int64 fencing_token = 7;
+  int64 step_ordinal = 8;
+  string idempotency_key = 9;
 }
 
 message HeartbeatRequest {
@@ -57,6 +59,8 @@ message CompleteTaskRequest {
   string payload_json = 6;
   int64 fencing_token = 7;
   bool retryable = 8;
+  int64 step_ordinal = 9;
+  string idempotency_key = 10;
 }
 
 message CompleteTaskResponse {

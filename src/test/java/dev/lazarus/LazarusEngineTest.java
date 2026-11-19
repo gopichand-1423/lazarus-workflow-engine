@@ -3,10 +3,12 @@ package dev.lazarus;
 import com.zaxxer.hikari.HikariConfig;
 import com.zaxxer.hikari.HikariDataSource;
 import dev.lazarus.engine.LazarusEngine;
+import dev.lazarus.engine.NonDeterministicWorkflowException;
 import dev.lazarus.store.EventStoreRepository;
 import dev.lazarus.store.TaskQueueRepository;
 import dev.lazarus.store.TaskQueueRepository.ClaimedTask;
 import dev.lazarus.store.TaskQueueRepository.ReapSummary;
+import dev.lazarus.workflow.StepContext;
 import org.junit.jupiter.api.*;
 
 import java.nio.file.Files;
@@ -20,6 +22,7 @@ import java.time.Instant;
 import java.util.*;
 import java.util.concurrent.Callable;
 import java.util.concurrent.Future;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -249,6 +252,120 @@ class LazarusEngineTest {
                 claim.taskId(), wfId, "step-identity", "worker-identity", claim.fencingToken(),
                 true, false, "{}", List.of("step-identity")));
         assertEquals(1, countEvents(wfId, "step-identity", "STEP_COMPLETED"));
+    }
+
+    @Test
+    @DisplayName("8. Repeated step keys use independent ordinals and replay each output")
+    void repeatedStepKeysReplayByOrdinal() throws Exception {
+        String wfId = "test-repeated-steps-" + UUID.randomUUID();
+        eventStore.createWorkflowInstance(wfId, "repeated", "{}");
+        AtomicInteger executions = new AtomicInteger();
+
+        LazarusEngine.DurableWorkflow<String, List<String>> workflow = (ctx, input) -> {
+            List<String> values = new ArrayList<>();
+            for (int i = 0; i < 3; i++) {
+                values.add(ctx.step("loop-item", String.class, step -> {
+                    executions.incrementAndGet();
+                    return "value-" + step.stepOrdinal();
+                }));
+            }
+            return values;
+        };
+
+        List<String> first = engine.submitWorkflow(wfId, "{}", workflow).get();
+        assertEquals(List.of("value-0", "value-1", "value-2"), first);
+        assertEquals(first, engine.submitWorkflow(wfId, "{}", workflow).get());
+        assertEquals(3, executions.get(), "Replay must not execute any already completed iteration");
+
+        try (Connection conn = dataSource.getConnection(); PreparedStatement ps = conn.prepareStatement("""
+                SELECT step_ordinal, idempotency_key FROM workflow_events
+                WHERE workflow_id = ? AND event_type = 'STEP_COMPLETED' ORDER BY step_ordinal
+                """)) {
+            ps.setString(1, wfId);
+            try (ResultSet rs = ps.executeQuery()) {
+                Set<String> keys = new HashSet<>();
+                for (long ordinal = 0; ordinal < 3; ordinal++) {
+                    assertTrue(rs.next());
+                    assertEquals(ordinal, rs.getLong("step_ordinal"));
+                    keys.add(rs.getString("idempotency_key"));
+                }
+                assertFalse(rs.next());
+                assertEquals(3, keys.size());
+            }
+        }
+    }
+
+    @Test
+    @DisplayName("9. Replay fails fast when code changes a recorded step at an ordinal")
+    void changedStepKeyRaisesNonDeterministicWorkflowException() throws Exception {
+        String wfId = "test-nondeterminism-" + UUID.randomUUID();
+        eventStore.createWorkflowInstance(wfId, "versioned", "{}");
+        LazarusEngine.DurableWorkflow<String, String> original = (ctx, input) -> {
+            ctx.step("first", String.class, () -> "one");
+            return ctx.step("second", String.class, () -> "two");
+        };
+        assertEquals("two", engine.submitWorkflow(wfId, "{}", original).get());
+
+        LazarusEngine.DurableWorkflow<String, String> changed = (ctx, input) ->
+                ctx.step("renamed-first", String.class, () -> "new");
+        ExecutionException failure = assertThrows(ExecutionException.class,
+                () -> engine.submitWorkflow(wfId, "{}", changed).get());
+        assertInstanceOf(NonDeterministicWorkflowException.class, failure.getCause());
+    }
+
+    @Test
+    @DisplayName("10. Crash after external side effect retries with the same idempotency key")
+    void crashBeforeStepCommitReusesIdempotencyKey() throws Exception {
+        String wfId = "test-idempotency-" + UUID.randomUUID();
+        eventStore.createWorkflowInstance(wfId, "external-activity", "{}");
+        Map<String, String> deduplicatedService = new java.util.concurrent.ConcurrentHashMap<>();
+        AtomicInteger sideEffects = new AtomicInteger();
+        AtomicBoolean crashOnce = new AtomicBoolean(true);
+        List<String> observedKeys = java.util.Collections.synchronizedList(new ArrayList<>());
+
+        LazarusEngine.DurableWorkflow<String, String> workflow = (ctx, input) ->
+                ctx.step("charge-card", String.class, step -> {
+                    observedKeys.add(step.idempotencyKey());
+                    String result = deduplicatedService.computeIfAbsent(step.idempotencyKey(), key -> {
+                        sideEffects.incrementAndGet();
+                        return "charged";
+                    });
+                    if (crashOnce.getAndSet(false)) throw new AssertionError("crash after side effect");
+                    return result;
+                });
+
+        ExecutionException crash = assertThrows(ExecutionException.class,
+                () -> engine.submitWorkflow(wfId, "{}", workflow).get());
+        assertInstanceOf(AssertionError.class, crash.getCause());
+        assertEquals("charged", engine.submitWorkflow(wfId, "{}", workflow).get());
+        assertEquals(1, sideEffects.get(), "The idempotent external service must apply the effect once");
+        assertEquals(2, observedKeys.size());
+        assertEquals(observedKeys.getFirst(), observedKeys.getLast());
+    }
+
+    @Test
+    @DisplayName("11. Local engine records terminal status, payload, and events")
+    void localEnginePersistsTerminalLifecycle() throws Exception {
+        String successId = "test-local-completed-" + UUID.randomUUID();
+        String failureId = "test-local-failed-" + UUID.randomUUID();
+        eventStore.createWorkflowInstance(successId, "local", "{}");
+        eventStore.createWorkflowInstance(failureId, "local", "{}");
+
+        assertEquals("finished", engine.submitWorkflow(successId, "{}", (ctx, input) -> "finished").get());
+        ExecutionException failure = assertThrows(ExecutionException.class,
+                () -> engine.submitWorkflow(failureId, "{}", (ctx, input) -> {
+                    throw new IllegalArgumentException("local failure");
+                }).get());
+        assertInstanceOf(IllegalArgumentException.class, failure.getCause());
+
+        EventStoreRepository.WorkflowInstance completed = eventStore.loadWorkflowInstance(successId).orElseThrow();
+        EventStoreRepository.WorkflowInstance failed = eventStore.loadWorkflowInstance(failureId).orElseThrow();
+        assertEquals("COMPLETED", completed.status());
+        assertEquals("\"finished\"", completed.outputPayloadJson());
+        assertEquals("FAILED", failed.status());
+        assertTrue(failed.outputPayloadJson().contains("local failure"));
+        assertEquals(1, countEvents(successId, "__workflow__", "WORKFLOW_COMPLETED"));
+        assertEquals(1, countEvents(failureId, "__workflow__", "WORKFLOW_FAILED"));
     }
 
     private static void markLeaseExpired(long taskId) throws Exception {

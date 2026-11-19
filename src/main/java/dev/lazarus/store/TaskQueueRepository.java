@@ -1,6 +1,7 @@
 package dev.lazarus.store;
 
 import javax.sql.DataSource;
+import dev.lazarus.workflow.StepContext;
 import java.sql.*;
 import java.util.List;
 import java.util.Optional;
@@ -13,12 +14,16 @@ public class TaskQueueRepository {
         String stepKey,
         String inputJson,
         int attempt,
-        long fencingToken
+        long fencingToken,
+        long stepOrdinal,
+        String idempotencyKey
     ) {}
 
     public record ReapSummary(int rescheduledCount, int deadLetteredCount) {}
 
-    private record ExpiredTask(long taskId, int attempt, int maxAttempts, String workflowId, String stepKey) {}
+    private record TaskIdentity(long stepOrdinal, String idempotencyKey) {}
+    private record ExpiredTask(long taskId, int attempt, int maxAttempts, String workflowId, String stepKey,
+                               long stepOrdinal, String idempotencyKey) {}
 
     private final DataSource dataSource;
     private final boolean isH2;
@@ -40,34 +45,43 @@ public class TaskQueueRepository {
      * Enqueues a workflow step idempotently.
      */
     public void enqueueTask(String workflowId, String stepKey, int maxAttempts) throws SQLException {
+        enqueueTask(workflowId, stepKey, 0, maxAttempts);
+    }
+
+    public void enqueueTask(String workflowId, String stepKey, long stepOrdinal, int maxAttempts) throws SQLException {
+        String idempotencyKey = StepContext.idempotencyKey(workflowId, stepOrdinal, stepKey);
         if (isH2) {
             String sql = """
-                INSERT INTO workflow_tasks (workflow_id, step_key, status, max_attempts, next_run_at)
-                SELECT ?, ?, 'PENDING', ?, NOW()
-                WHERE NOT EXISTS (SELECT 1 FROM workflow_tasks WHERE workflow_id = ? AND step_key = ?)
+                INSERT INTO workflow_tasks (workflow_id, step_key, step_ordinal, idempotency_key, status, max_attempts, next_run_at)
+                SELECT ?, ?, ?, ?, 'PENDING', ?, NOW()
+                WHERE NOT EXISTS (SELECT 1 FROM workflow_tasks WHERE workflow_id = ? AND step_ordinal = ?)
                 """;
             try (Connection conn = dataSource.getConnection();
                  PreparedStatement ps = conn.prepareStatement(sql)) {
                 ps.setString(1, workflowId);
                 ps.setString(2, stepKey);
-                ps.setInt(3, maxAttempts);
-                ps.setString(4, workflowId);
-                ps.setString(5, stepKey);
+                ps.setLong(3, stepOrdinal);
+                ps.setString(4, idempotencyKey);
+                ps.setInt(5, maxAttempts);
+                ps.setString(6, workflowId);
+                ps.setLong(7, stepOrdinal);
                 ps.executeUpdate();
             }
             return;
         }
 
         String sql = """
-            INSERT INTO workflow_tasks (workflow_id, step_key, status, max_attempts, next_run_at)
-            VALUES (?, ?, 'PENDING', ?, NOW())
-            ON CONFLICT (workflow_id, step_key) DO NOTHING
+            INSERT INTO workflow_tasks (workflow_id, step_key, step_ordinal, idempotency_key, status, max_attempts, next_run_at)
+            VALUES (?, ?, ?, ?, 'PENDING', ?, NOW())
+            ON CONFLICT (workflow_id, step_ordinal) DO NOTHING
             """;
         try (Connection conn = dataSource.getConnection();
              PreparedStatement ps = conn.prepareStatement(sql)) {
             ps.setString(1, workflowId);
             ps.setString(2, stepKey);
-            ps.setInt(3, maxAttempts);
+            ps.setLong(3, stepOrdinal);
+            ps.setString(4, idempotencyKey);
+            ps.setInt(5, maxAttempts);
             ps.executeUpdate();
         }
     }
@@ -79,7 +93,8 @@ public class TaskQueueRepository {
     public Optional<ClaimedTask> pollNextTask(String workerId, int leaseDurationSeconds) throws SQLException {
         if (isH2) {
             String selectSql = """
-                SELECT wt.task_id, wt.workflow_id, wt.step_key, wt.attempt, wt.fencing_token, wi.input_payload
+                SELECT wt.task_id, wt.workflow_id, wt.step_key, wt.attempt, wt.fencing_token,
+                       wt.step_ordinal, wt.idempotency_key, wi.input_payload
                 FROM workflow_tasks wt
                 JOIN workflow_instances wi ON wi.workflow_id = wt.workflow_id
                 WHERE wt.status = 'PENDING'
@@ -94,6 +109,7 @@ public class TaskQueueRepository {
                     worker_id = ?,
                     attempt = ?,
                     fencing_token = ?,
+                    idempotency_key = COALESCE(idempotency_key, ?),
                     lease_expires_at = DATEADD('SECOND', ?, NOW())
                 WHERE task_id = ?
                   AND status = 'PENDING'
@@ -107,6 +123,8 @@ public class TaskQueueRepository {
                     String stepKey;
                     int newAttempt;
                     long newFencingToken;
+                    long stepOrdinal;
+                    String idempotencyKey;
                     String inputJson;
                     try (PreparedStatement ps = conn.prepareStatement(selectSql);
                          ResultSet rs = ps.executeQuery()) {
@@ -119,21 +137,27 @@ public class TaskQueueRepository {
                         stepKey = rs.getString("step_key");
                         newAttempt = rs.getInt("attempt") + 1;
                         newFencingToken = rs.getLong("fencing_token") + 1;
+                        stepOrdinal = rs.getLong("step_ordinal");
+                        idempotencyKey = rs.getString("idempotency_key");
+                        if (idempotencyKey == null) idempotencyKey = StepContext.idempotencyKey(workflowId, stepOrdinal, stepKey);
                         inputJson = rs.getString("input_payload");
                     }
                     try (PreparedStatement updPs = conn.prepareStatement(updateSql)) {
                         updPs.setString(1, workerId);
                         updPs.setInt(2, newAttempt);
                         updPs.setLong(3, newFencingToken);
-                        updPs.setInt(4, leaseDurationSeconds);
-                        updPs.setLong(5, taskId);
+                        updPs.setString(4, idempotencyKey);
+                        updPs.setInt(5, leaseDurationSeconds);
+                        updPs.setLong(6, taskId);
                         if (updPs.executeUpdate() != 1) {
                             conn.rollback();
                             return Optional.empty();
                         }
                     }
+                    appendEventInTransaction(conn, workflowId, stepKey, "STEP_STARTED", "{}", stepOrdinal, idempotencyKey);
                     conn.commit();
-                    return Optional.of(new ClaimedTask(taskId, workflowId, stepKey, inputJson, newAttempt, newFencingToken));
+                    return Optional.of(new ClaimedTask(taskId, workflowId, stepKey, inputJson, newAttempt,
+                            newFencingToken, stepOrdinal, idempotencyKey));
                 } catch (SQLException ex) {
                     conn.rollback();
                     throw ex;
@@ -156,30 +180,42 @@ public class TaskQueueRepository {
                 worker_id = ?,
                 attempt = wt.attempt + 1,
                 fencing_token = wt.fencing_token + 1,
+                idempotency_key = COALESCE(wt.idempotency_key, wt.workflow_id || ':' || wt.step_ordinal || ':' || wt.step_key),
                 lease_expires_at = NOW() + (? * INTERVAL '1 second')
             FROM next_task nt, workflow_instances wi
             WHERE wt.task_id = nt.task_id
               AND wi.workflow_id = wt.workflow_id
-            RETURNING wt.task_id, wt.workflow_id, wt.step_key, wi.input_payload::text AS input_json, wt.attempt, wt.fencing_token
+            RETURNING wt.task_id, wt.workflow_id, wt.step_key, wi.input_payload::text AS input_json,
+                      wt.attempt, wt.fencing_token, wt.step_ordinal, wt.idempotency_key
             """;
 
-        try (Connection conn = dataSource.getConnection();
-             PreparedStatement ps = conn.prepareStatement(claimSql)) {
-            ps.setString(1, workerId);
-            ps.setInt(2, leaseDurationSeconds);
-
-            try (ResultSet rs = ps.executeQuery()) {
-                if (rs.next()) {
-                    return Optional.of(new ClaimedTask(
-                        rs.getLong("task_id"),
-                        rs.getString("workflow_id"),
-                        rs.getString("step_key"),
-                        rs.getString("input_json"),
-                        rs.getInt("attempt"),
-                        rs.getLong("fencing_token")
-                    ));
+        try (Connection conn = dataSource.getConnection()) {
+            conn.setAutoCommit(false);
+            try {
+                ClaimedTask task = null;
+                try (PreparedStatement ps = conn.prepareStatement(claimSql)) {
+                    ps.setString(1, workerId);
+                    ps.setInt(2, leaseDurationSeconds);
+                    try (ResultSet rs = ps.executeQuery()) {
+                        if (rs.next()) {
+                            task = new ClaimedTask(
+                                    rs.getLong("task_id"), rs.getString("workflow_id"), rs.getString("step_key"),
+                                    rs.getString("input_json"), rs.getInt("attempt"), rs.getLong("fencing_token"),
+                                    rs.getLong("step_ordinal"), rs.getString("idempotency_key"));
+                        }
+                    }
                 }
-                return Optional.empty();
+                if (task == null) {
+                    conn.rollback();
+                    return Optional.empty();
+                }
+                appendEventInTransaction(conn, task.workflowId(), task.stepKey(), "STEP_STARTED", "{}",
+                        task.stepOrdinal(), task.idempotencyKey());
+                conn.commit();
+                return Optional.of(task);
+            } catch (SQLException | RuntimeException ex) {
+                conn.rollback();
+                throw ex;
             }
         }
     }
@@ -242,8 +278,27 @@ public class TaskQueueRepository {
             String payloadJson,
             List<String> workflowStepKeys
     ) throws SQLException {
+        TaskIdentity identity = loadTaskIdentity(taskId);
+        if (identity == null) return false;
+        return completeTask(taskId, workflowId, stepKey, workerId, fencingToken,
+                identity.stepOrdinal(), identity.idempotencyKey(), success, retryable, payloadJson, workflowStepKeys);
+    }
+
+    public boolean completeTask(
+            long taskId,
+            String workflowId,
+            String stepKey,
+            String workerId,
+            long fencingToken,
+            long stepOrdinal,
+            String idempotencyKey,
+            boolean success,
+            boolean retryable,
+            String payloadJson,
+            List<String> workflowStepKeys
+    ) throws SQLException {
         int stepIndex = workflowStepKeys.indexOf(stepKey);
-        if (stepIndex < 0) {
+        if (stepIndex < 0 || stepIndex != stepOrdinal) {
             return false;
         }
         String nextStepKey = stepIndex + 1 < workflowStepKeys.size() ? workflowStepKeys.get(stepIndex + 1) : null;
@@ -257,6 +312,8 @@ public class TaskQueueRepository {
                   AND status = 'IN_PROGRESS'
                   AND worker_id = ?
                   AND fencing_token = ?
+                  AND step_ordinal = ?
+                  AND idempotency_key = ?
                   AND workflow_id = ?
                   AND step_key = ?
                   AND lease_expires_at > NOW()
@@ -270,6 +327,8 @@ public class TaskQueueRepository {
                   AND status = 'IN_PROGRESS'
                   AND worker_id = ?
                   AND fencing_token = ?
+                  AND step_ordinal = ?
+                  AND idempotency_key = ?
                   AND workflow_id = ?
                   AND step_key = ?
                   AND lease_expires_at > NOW()
@@ -282,6 +341,8 @@ public class TaskQueueRepository {
                   AND status = 'IN_PROGRESS'
                   AND worker_id = ?
                   AND fencing_token = ?
+                  AND step_ordinal = ?
+                  AND idempotency_key = ?
                   AND workflow_id = ?
                   AND step_key = ?
                   AND lease_expires_at > clock_timestamp()
@@ -295,6 +356,8 @@ public class TaskQueueRepository {
                   AND status = 'IN_PROGRESS'
                   AND worker_id = ?
                   AND fencing_token = ?
+                  AND step_ordinal = ?
+                  AND idempotency_key = ?
                   AND workflow_id = ?
                   AND step_key = ?
                   AND lease_expires_at > clock_timestamp()
@@ -314,6 +377,8 @@ public class TaskQueueRepository {
                     taskPs.setLong(parameter++, taskId);
                     taskPs.setString(parameter++, workerId);
                     taskPs.setLong(parameter++, fencingToken);
+                    taskPs.setLong(parameter++, stepOrdinal);
+                    taskPs.setString(parameter++, idempotencyKey);
                     taskPs.setString(parameter++, workflowId);
                     taskPs.setString(parameter, stepKey);
                     if (taskPs.executeUpdate() != 1) {
@@ -323,10 +388,10 @@ public class TaskQueueRepository {
                 }
 
                 String eventType = success ? "STEP_COMPLETED" : "STEP_FAILED";
-                appendEventInTransaction(conn, workflowId, stepKey, eventType, payloadJson);
+                appendEventInTransaction(conn, workflowId, stepKey, eventType, payloadJson, stepOrdinal, idempotencyKey);
 
                 if (success && nextStepKey != null) {
-                    enqueueTaskInTransaction(conn, workflowId, nextStepKey, 5);
+                    enqueueTaskInTransaction(conn, workflowId, nextStepKey, stepOrdinal + 1, 5);
                 } else if (success) {
                     if (!updateWorkflowTerminalInTransaction(conn, workflowId, "COMPLETED", payloadJson)) {
                         conn.rollback();
@@ -350,23 +415,27 @@ public class TaskQueueRepository {
         }
     }
 
-    private void enqueueTaskInTransaction(Connection conn, String workflowId, String stepKey, int maxAttempts) throws SQLException {
+    private void enqueueTaskInTransaction(Connection conn, String workflowId, String stepKey,
+                                          long stepOrdinal, int maxAttempts) throws SQLException {
+        String idempotencyKey = StepContext.idempotencyKey(workflowId, stepOrdinal, stepKey);
         String sql = isH2 ? """
-            INSERT INTO workflow_tasks (workflow_id, step_key, status, max_attempts, next_run_at)
-            SELECT ?, ?, 'PENDING', ?, NOW()
-            WHERE NOT EXISTS (SELECT 1 FROM workflow_tasks WHERE workflow_id = ? AND step_key = ?)
+            INSERT INTO workflow_tasks (workflow_id, step_key, step_ordinal, idempotency_key, status, max_attempts, next_run_at)
+            SELECT ?, ?, ?, ?, 'PENDING', ?, NOW()
+            WHERE NOT EXISTS (SELECT 1 FROM workflow_tasks WHERE workflow_id = ? AND step_ordinal = ?)
             """ : """
-            INSERT INTO workflow_tasks (workflow_id, step_key, status, max_attempts, next_run_at)
-            VALUES (?, ?, 'PENDING', ?, NOW())
-            ON CONFLICT (workflow_id, step_key) DO NOTHING
+            INSERT INTO workflow_tasks (workflow_id, step_key, step_ordinal, idempotency_key, status, max_attempts, next_run_at)
+            VALUES (?, ?, ?, ?, 'PENDING', ?, NOW())
+            ON CONFLICT (workflow_id, step_ordinal) DO NOTHING
             """;
         try (PreparedStatement ps = conn.prepareStatement(sql)) {
             ps.setString(1, workflowId);
             ps.setString(2, stepKey);
-            ps.setInt(3, maxAttempts);
+            ps.setLong(3, stepOrdinal);
+            ps.setString(4, idempotencyKey);
+            ps.setInt(5, maxAttempts);
             if (isH2) {
-                ps.setString(4, workflowId);
-                ps.setString(5, stepKey);
+                ps.setString(6, workflowId);
+                ps.setLong(7, stepOrdinal);
             }
             ps.executeUpdate();
         }
@@ -379,16 +448,30 @@ public class TaskQueueRepository {
             String eventType,
             String payloadJson
     ) throws SQLException {
+        appendEventInTransaction(conn, workflowId, stepKey, eventType, payloadJson, null, null);
+    }
+
+    private void appendEventInTransaction(
+            Connection conn,
+            String workflowId,
+            String stepKey,
+            String eventType,
+            String payloadJson,
+            Long stepOrdinal,
+            String idempotencyKey
+    ) throws SQLException {
         long sequence;
+        int workflowVersion;
         if (isH2) {
             try (PreparedStatement ps = conn.prepareStatement(
-                    "SELECT current_version FROM workflow_instances WHERE workflow_id = ? FOR UPDATE")) {
+                    "SELECT current_version, workflow_version FROM workflow_instances WHERE workflow_id = ? FOR UPDATE")) {
                 ps.setString(1, workflowId);
                 try (ResultSet rs = ps.executeQuery()) {
                     if (!rs.next()) {
                         throw new IllegalStateException("Workflow instance missing: " + workflowId);
                     }
                     sequence = rs.getLong(1) + 1;
+                    workflowVersion = rs.getInt(2);
                 }
             }
             try (PreparedStatement ps = conn.prepareStatement("""
@@ -404,7 +487,7 @@ public class TaskQueueRepository {
                     UPDATE workflow_instances
                     SET current_version = current_version + 1, updated_at = NOW()
                     WHERE workflow_id = ?
-                    RETURNING current_version
+                    RETURNING current_version, workflow_version
                     """)) {
                 ps.setString(1, workflowId);
                 try (ResultSet rs = ps.executeQuery()) {
@@ -412,16 +495,19 @@ public class TaskQueueRepository {
                         throw new IllegalStateException("Workflow instance missing: " + workflowId);
                     }
                     sequence = rs.getLong(1);
+                    workflowVersion = rs.getInt(2);
                 }
             }
         }
 
         String sql = isH2 ? """
-            INSERT INTO workflow_events (workflow_id, sequence_num, step_key, event_type, payload)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO workflow_events (workflow_id, sequence_num, step_key, event_type, payload,
+                                         step_ordinal, idempotency_key, workflow_version)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """ : """
-            INSERT INTO workflow_events (workflow_id, sequence_num, step_key, event_type, payload)
-            VALUES (?, ?, ?, ?, ?::jsonb)
+            INSERT INTO workflow_events (workflow_id, sequence_num, step_key, event_type, payload,
+                                         step_ordinal, idempotency_key, workflow_version)
+            VALUES (?, ?, ?, ?, ?::jsonb, ?, ?, ?)
             """;
         try (PreparedStatement ps = conn.prepareStatement(sql)) {
             ps.setString(1, workflowId);
@@ -429,7 +515,24 @@ public class TaskQueueRepository {
             ps.setString(3, stepKey);
             ps.setString(4, eventType);
             ps.setString(5, payloadJson);
+            if (stepOrdinal == null) ps.setNull(6, Types.BIGINT); else ps.setLong(6, stepOrdinal);
+            ps.setString(7, idempotencyKey);
+            ps.setInt(8, workflowVersion);
             ps.executeUpdate();
+        }
+    }
+
+    private TaskIdentity loadTaskIdentity(long taskId) throws SQLException {
+        try (Connection conn = dataSource.getConnection(); PreparedStatement ps = conn.prepareStatement(
+                "SELECT workflow_id, step_key, step_ordinal, idempotency_key FROM workflow_tasks WHERE task_id = ?")) {
+            ps.setLong(1, taskId);
+            try (ResultSet rs = ps.executeQuery()) {
+                if (!rs.next()) return null;
+                long ordinal = rs.getLong("step_ordinal");
+                String key = rs.getString("idempotency_key");
+                if (key == null) key = StepContext.idempotencyKey(rs.getString("workflow_id"), ordinal, rs.getString("step_key"));
+                return new TaskIdentity(ordinal, key);
+            }
         }
     }
 
@@ -473,7 +576,7 @@ public class TaskQueueRepository {
     public ReapSummary reapZombieTasks(int batchSize) throws SQLException {
         if (isH2) {
             String selectExpired = """
-                SELECT task_id, attempt, max_attempts, workflow_id, step_key
+                SELECT task_id, attempt, max_attempts, workflow_id, step_key, step_ordinal, idempotency_key
                 FROM workflow_tasks
                 WHERE status = 'IN_PROGRESS'
                   AND lease_expires_at < NOW()
@@ -509,7 +612,11 @@ public class TaskQueueRepository {
                                         rs.getInt("attempt"),
                                         rs.getInt("max_attempts"),
                                         rs.getString("workflow_id"),
-                                        rs.getString("step_key")));
+                                        rs.getString("step_key"),
+                                        rs.getLong("step_ordinal"),
+                                        rs.getString("idempotency_key") == null
+                                                ? StepContext.idempotencyKey(rs.getString("workflow_id"), rs.getLong("step_ordinal"), rs.getString("step_key"))
+                                                : rs.getString("idempotency_key")));
                             }
                         }
                     }
@@ -520,7 +627,8 @@ public class TaskQueueRepository {
                                 ps.setLong(1, item.taskId());
                                 ps.executeUpdate();
                             }
-                            markWorkflowFailedForExpiredTask(conn, item.workflowId(), item.stepKey(), item.attempt());
+                            markWorkflowFailedForExpiredTask(conn, item.workflowId(), item.stepKey(), item.stepOrdinal(),
+                                    item.idempotencyKey(), item.attempt());
                             deadLettered++;
                         } else {
                             try (PreparedStatement ps = conn.prepareStatement(rescheduleTask)) {
@@ -559,7 +667,7 @@ public class TaskQueueRepository {
                 END
             FROM expired e
             WHERE wt.task_id = e.task_id
-            RETURNING wt.status, wt.workflow_id, wt.step_key, wt.attempt
+            RETURNING wt.status, wt.workflow_id, wt.step_key, wt.step_ordinal, wt.idempotency_key, wt.attempt
             """;
 
         int rescheduled = 0;
@@ -578,6 +686,8 @@ public class TaskQueueRepository {
                                         conn,
                                         rs.getString("workflow_id"),
                                         rs.getString("step_key"),
+                                        rs.getLong("step_ordinal"),
+                                        rs.getString("idempotency_key"),
                                         rs.getInt("attempt"));
                                 deadLettered++;
                             } else {
@@ -599,11 +709,13 @@ public class TaskQueueRepository {
             Connection conn,
             String workflowId,
             String stepKey,
+            long stepOrdinal,
+            String idempotencyKey,
             int attempt
     ) throws SQLException {
         String reasonJson = "{\"error\":\"LEASE_ATTEMPTS_EXHAUSTED\",\"attempt\":" + attempt + "}";
         if (updateWorkflowTerminalInTransaction(conn, workflowId, "FAILED", reasonJson)) {
-            appendEventInTransaction(conn, workflowId, stepKey, "STEP_FAILED", reasonJson);
+            appendEventInTransaction(conn, workflowId, stepKey, "STEP_FAILED", reasonJson, stepOrdinal, idempotencyKey);
             appendEventInTransaction(conn, workflowId, "__workflow__", "WORKFLOW_FAILED", reasonJson);
         }
     }

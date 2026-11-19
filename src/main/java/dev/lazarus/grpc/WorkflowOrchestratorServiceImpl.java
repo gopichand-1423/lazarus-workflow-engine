@@ -52,7 +52,7 @@ public class WorkflowOrchestratorServiceImpl extends WorkflowOrchestratorService
             );
             String status = "RUNNING";
             if (created) {
-                taskQueue.enqueueTask(request.getWorkflowId(), definition.stepKeys().getFirst(), 5);
+                taskQueue.enqueueTask(request.getWorkflowId(), definition.stepKeys().getFirst(), 0, 5);
             } else {
                 WorkflowInstance existing = eventStore.loadWorkflowInstance(request.getWorkflowId())
                         .orElseThrow(() -> new IllegalStateException("Workflow instance disappeared after create"));
@@ -91,7 +91,9 @@ public class WorkflowOrchestratorServiceImpl extends WorkflowOrchestratorService
                        .setStepKey(task.stepKey())
                        .setInputJson(task.inputJson())
                        .setAttempt(task.attempt())
-                       .setFencingToken(task.fencingToken());
+                       .setFencingToken(task.fencingToken())
+                       .setStepOrdinal(task.stepOrdinal())
+                       .setIdempotencyKey(task.idempotencyKey());
             } else {
                 builder.setTaskFound(false);
             }
@@ -144,6 +146,8 @@ public class WorkflowOrchestratorServiceImpl extends WorkflowOrchestratorService
                     request.getStepKey(),
                     request.getWorkerId(),
                     request.getFencingToken(),
+                    request.getStepOrdinal(),
+                    request.getIdempotencyKey(),
                     request.getSuccess(),
                     request.getRetryable(),
                     request.getPayloadJson(),

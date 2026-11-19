@@ -197,6 +197,8 @@ class LazarusGrpcIntegrationTest {
                 .setStepKey(task.getStepKey())
                 .setWorkerId(workerId)
                 .setFencingToken(task.getFencingToken())
+                .setStepOrdinal(task.getStepOrdinal())
+                .setIdempotencyKey(task.getIdempotencyKey())
                 .setSuccess(success)
                 .setRetryable(retryable)
                 .setPayloadJson(payload)

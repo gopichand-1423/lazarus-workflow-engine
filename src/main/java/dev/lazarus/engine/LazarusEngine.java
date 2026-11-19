@@ -6,6 +6,7 @@ import dev.lazarus.store.EventStoreRepository;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.Map;
 
 public class LazarusEngine implements AutoCloseable {
 
@@ -25,8 +26,23 @@ public class LazarusEngine implements AutoCloseable {
 
     public <I, O> Future<O> submitWorkflow(String workflowId, I input, DurableWorkflow<I, O> workflow) {
         return virtualExecutor.submit(() -> {
-            WorkflowContext ctx = new WorkflowContext(workflowId, eventStore, mapper);
-            return workflow.execute(ctx, input);
+            try {
+                WorkflowContext ctx = new WorkflowContext(workflowId, eventStore, mapper);
+                O result = workflow.execute(ctx, input);
+                eventStore.recordWorkflowTerminal(workflowId, "COMPLETED", mapper.writeValueAsString(result));
+                return result;
+            } catch (Throwable failure) {
+                String reason = failure.getMessage() == null ? failure.getClass().getSimpleName() : failure.getMessage();
+                try {
+                    eventStore.recordWorkflowTerminal(workflowId, "FAILED",
+                            mapper.writeValueAsString(Map.of("error", reason)));
+                } catch (Throwable persistenceFailure) {
+                    failure.addSuppressed(persistenceFailure);
+                }
+                if (failure instanceof Exception exception) throw exception;
+                if (failure instanceof Error error) throw error;
+                throw new IllegalStateException(failure);
+            }
         });
     }
 

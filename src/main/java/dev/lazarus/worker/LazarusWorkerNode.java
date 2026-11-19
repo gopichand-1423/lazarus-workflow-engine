@@ -1,6 +1,7 @@
 package dev.lazarus.worker;
 
 import dev.lazarus.proto.*;
+import dev.lazarus.workflow.StepContext;
 import io.grpc.ManagedChannel;
 
 import java.time.Duration;
@@ -12,6 +13,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Function;
+import java.util.function.BiFunction;
 
 public class LazarusWorkerNode implements AutoCloseable {
 
@@ -19,7 +21,7 @@ public class LazarusWorkerNode implements AutoCloseable {
     private final WorkflowOrchestratorServiceGrpc.WorkflowOrchestratorServiceBlockingStub stub;
     private final int leaseDurationSeconds;
     private final ExecutorService virtualExecutor = Executors.newVirtualThreadPerTaskExecutor();
-    private final Map<String, Function<String, String>> stepHandlers = new ConcurrentHashMap<>();
+    private final Map<String, BiFunction<String, StepContext, String>> stepHandlers = new ConcurrentHashMap<>();
     private final AtomicBoolean running = new AtomicBoolean(false);
 
     public LazarusWorkerNode(String workerId, ManagedChannel channel, int leaseDurationSeconds) {
@@ -29,6 +31,10 @@ public class LazarusWorkerNode implements AutoCloseable {
     }
 
     public void registerStepHandler(String stepKey, Function<String, String> handler) {
+        stepHandlers.put(stepKey, (input, ignored) -> handler.apply(input));
+    }
+
+    public void registerStepHandler(String stepKey, BiFunction<String, StepContext, String> handler) {
         stepHandlers.put(stepKey, handler);
     }
 
@@ -70,11 +76,13 @@ public class LazarusWorkerNode implements AutoCloseable {
         AtomicBoolean fencedOff = new AtomicBoolean(false);
 
         Callable<String> work = () -> {
-            Function<String, String> handler = stepHandlers.get(task.getStepKey());
+            BiFunction<String, StepContext, String> handler = stepHandlers.get(task.getStepKey());
             if (handler == null) {
                 throw new IllegalArgumentException("No worker handler registered for step key: " + task.getStepKey());
             }
-            return handler.apply(task.getInputJson());
+            StepContext stepContext = new StepContext(task.getWorkflowId(), task.getStepOrdinal(),
+                    task.getStepKey(), task.getIdempotencyKey());
+            return handler.apply(task.getInputJson(), stepContext);
         };
 
         Future<String> executionFuture = virtualExecutor.submit(work);
@@ -126,6 +134,8 @@ public class LazarusWorkerNode implements AutoCloseable {
                         .setSuccess(true)
                         .setPayloadJson(outputJson)
                         .setFencingToken(task.getFencingToken())
+                        .setStepOrdinal(task.getStepOrdinal())
+                        .setIdempotencyKey(task.getIdempotencyKey())
                         .build());
                 if (!completion.getCommitted()) {
                     System.err.printf("[FENCED] Completion rejected for task %d: %s%n",
@@ -150,6 +160,8 @@ public class LazarusWorkerNode implements AutoCloseable {
                         .setSuccess(false)
                         .setPayloadJson(errorJson)
                         .setFencingToken(task.getFencingToken())
+                        .setStepOrdinal(task.getStepOrdinal())
+                        .setIdempotencyKey(task.getIdempotencyKey())
                         .setRetryable(!(failure instanceof IllegalArgumentException))
                         .build());
                 if (!completion.getCommitted()) {
