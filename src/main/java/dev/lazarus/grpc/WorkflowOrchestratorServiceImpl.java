@@ -57,7 +57,8 @@ public class WorkflowOrchestratorServiceImpl extends WorkflowOrchestratorService
                        .setWorkflowId(task.workflowId())
                        .setStepKey(task.stepKey())
                        .setInputJson(task.inputJson())
-                       .setAttempt(task.attempt());
+                       .setAttempt(task.attempt())
+                       .setFencingToken(task.fencingToken());
             } else {
                 builder.setTaskFound(false);
             }
@@ -73,7 +74,8 @@ public class WorkflowOrchestratorServiceImpl extends WorkflowOrchestratorService
     public void recordHeartbeat(HeartbeatRequest request, StreamObserver<HeartbeatResponse> responseObserver) {
         try {
             int extendSec = request.getExtendSeconds() > 0 ? request.getExtendSeconds() : 15;
-            boolean valid = taskQueue.extendLease(request.getTaskId(), request.getWorkerId(), extendSec);
+            boolean valid = taskQueue.extendLease(
+                    request.getTaskId(), request.getWorkerId(), request.getFencingToken(), extendSec);
 
             HeartbeatResponse response = HeartbeatResponse.newBuilder()
                     .setLeaseValid(valid)
@@ -93,13 +95,17 @@ public class WorkflowOrchestratorServiceImpl extends WorkflowOrchestratorService
                     request.getWorkflowId(),
                     request.getStepKey(),
                     request.getWorkerId(),
+                    request.getFencingToken(),
                     request.getSuccess(),
                     request.getPayloadJson()
             );
 
-            CompleteTaskResponse response = CompleteTaskResponse.newBuilder()
-                    .setCommitted(committed)
-                    .build();
+            CompleteTaskResponse.Builder responseBuilder = CompleteTaskResponse.newBuilder()
+                    .setCommitted(committed);
+            if (!committed) {
+                responseBuilder.setRejectionReason("STALE_LEASE_OR_FENCING_TOKEN");
+            }
+            CompleteTaskResponse response = responseBuilder.build();
             responseObserver.onNext(response);
             responseObserver.onCompleted();
         } catch (Exception ex) {

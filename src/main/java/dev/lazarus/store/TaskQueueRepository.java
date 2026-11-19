@@ -11,7 +11,8 @@ public class TaskQueueRepository {
         String workflowId,
         String stepKey,
         String inputJson,
-        int attempt
+        int attempt,
+        long fencingToken
     ) {}
 
     public record ReapSummary(int rescheduledCount, int deadLetteredCount) {}
@@ -75,7 +76,7 @@ public class TaskQueueRepository {
     public Optional<ClaimedTask> pollNextTask(String workerId, int leaseDurationSeconds) throws SQLException {
         if (isH2) {
             String selectSql = """
-                SELECT wt.task_id, wt.workflow_id, wt.step_key, wt.attempt, wi.input_payload
+                SELECT wt.task_id, wt.workflow_id, wt.step_key, wt.attempt, wt.fencing_token, wi.input_payload
                 FROM workflow_tasks wt
                 JOIN workflow_instances wi ON wi.workflow_id = wt.workflow_id
                 WHERE wt.status = 'PENDING'
@@ -89,8 +90,11 @@ public class TaskQueueRepository {
                 SET status = 'IN_PROGRESS',
                     worker_id = ?,
                     attempt = ?,
+                    fencing_token = ?,
                     lease_expires_at = DATEADD('SECOND', ?, NOW())
                 WHERE task_id = ?
+                  AND status = 'PENDING'
+                  AND next_run_at <= NOW()
                 """;
             try (Connection conn = dataSource.getConnection()) {
                 conn.setAutoCommit(false);
@@ -99,6 +103,7 @@ public class TaskQueueRepository {
                     String workflowId;
                     String stepKey;
                     int newAttempt;
+                    long newFencingToken;
                     String inputJson;
                     try (PreparedStatement ps = conn.prepareStatement(selectSql);
                          ResultSet rs = ps.executeQuery()) {
@@ -110,17 +115,22 @@ public class TaskQueueRepository {
                         workflowId = rs.getString("workflow_id");
                         stepKey = rs.getString("step_key");
                         newAttempt = rs.getInt("attempt") + 1;
+                        newFencingToken = rs.getLong("fencing_token") + 1;
                         inputJson = rs.getString("input_payload");
                     }
                     try (PreparedStatement updPs = conn.prepareStatement(updateSql)) {
                         updPs.setString(1, workerId);
                         updPs.setInt(2, newAttempt);
-                        updPs.setInt(3, leaseDurationSeconds);
-                        updPs.setLong(4, taskId);
-                        updPs.executeUpdate();
+                        updPs.setLong(3, newFencingToken);
+                        updPs.setInt(4, leaseDurationSeconds);
+                        updPs.setLong(5, taskId);
+                        if (updPs.executeUpdate() != 1) {
+                            conn.rollback();
+                            return Optional.empty();
+                        }
                     }
                     conn.commit();
-                    return Optional.of(new ClaimedTask(taskId, workflowId, stepKey, inputJson, newAttempt));
+                    return Optional.of(new ClaimedTask(taskId, workflowId, stepKey, inputJson, newAttempt, newFencingToken));
                 } catch (SQLException ex) {
                     conn.rollback();
                     throw ex;
@@ -142,11 +152,12 @@ public class TaskQueueRepository {
             SET status = 'IN_PROGRESS',
                 worker_id = ?,
                 attempt = wt.attempt + 1,
+                fencing_token = wt.fencing_token + 1,
                 lease_expires_at = NOW() + (? * INTERVAL '1 second')
             FROM next_task nt, workflow_instances wi
             WHERE wt.task_id = nt.task_id
               AND wi.workflow_id = wt.workflow_id
-            RETURNING wt.task_id, wt.workflow_id, wt.step_key, wi.input_payload::text AS input_json, wt.attempt
+            RETURNING wt.task_id, wt.workflow_id, wt.step_key, wi.input_payload::text AS input_json, wt.attempt, wt.fencing_token
             """;
 
         try (Connection conn = dataSource.getConnection();
@@ -161,7 +172,8 @@ public class TaskQueueRepository {
                         rs.getString("workflow_id"),
                         rs.getString("step_key"),
                         rs.getString("input_json"),
-                        rs.getInt("attempt")
+                        rs.getInt("attempt"),
+                        rs.getLong("fencing_token")
                     ));
                 }
                 return Optional.empty();
@@ -172,13 +184,14 @@ public class TaskQueueRepository {
     /**
      * Extends an active task lease. Returns false if the worker lost ownership (fenced off).
      */
-    public boolean extendLease(long taskId, String workerId, int extendSeconds) throws SQLException {
+    public boolean extendLease(long taskId, String workerId, long fencingToken, int extendSeconds) throws SQLException {
         if (isH2) {
             String sql = """
                 UPDATE workflow_tasks
                 SET lease_expires_at = DATEADD('SECOND', ?, NOW())
                 WHERE task_id = ?
                   AND worker_id = ?
+                  AND fencing_token = ?
                   AND status = 'IN_PROGRESS'
                   AND lease_expires_at > NOW()
                 """;
@@ -187,6 +200,7 @@ public class TaskQueueRepository {
                 ps.setInt(1, extendSeconds);
                 ps.setLong(2, taskId);
                 ps.setString(3, workerId);
+                ps.setLong(4, fencingToken);
                 return ps.executeUpdate() == 1;
             }
         }
@@ -196,79 +210,121 @@ public class TaskQueueRepository {
             SET lease_expires_at = NOW() + (? * INTERVAL '1 second')
             WHERE task_id = ?
               AND worker_id = ?
+              AND fencing_token = ?
               AND status = 'IN_PROGRESS'
-              AND lease_expires_at > NOW()
+              AND lease_expires_at > clock_timestamp()
             """;
         try (Connection conn = dataSource.getConnection();
              PreparedStatement ps = conn.prepareStatement(sql)) {
             ps.setInt(1, extendSeconds);
             ps.setLong(2, taskId);
             ps.setString(3, workerId);
+            ps.setLong(4, fencingToken);
             return ps.executeUpdate() == 1;
         }
     }
 
     /**
      * Commits task completion or schedules exponential backoff retry atomically with event log append.
-     * Rejects zombie workers whose lease was already reaped.
+     * Rejects stale claim tokens, mismatched task identities, and expired leases.
      */
     public boolean completeTask(
             long taskId,
             String workflowId,
             String stepKey,
             String workerId,
+            long fencingToken,
             boolean success,
             String payloadJson
     ) throws SQLException {
+        String taskUpdateSql;
         if (isH2) {
-            String verifyLeaseSql = """
-                SELECT attempt, max_attempts
-                FROM workflow_tasks
-                WHERE task_id = ?
-                  AND worker_id = ?
-                  AND status = 'IN_PROGRESS'
-                FOR UPDATE
-                """;
-
-            String markCompletedSql = """
+            taskUpdateSql = success ? """
                 UPDATE workflow_tasks
-                SET status = 'COMPLETED', lease_expires_at = NULL
+                SET status = 'COMPLETED', worker_id = NULL, lease_expires_at = NULL
                 WHERE task_id = ?
-                """;
-
-            String rescheduleSql = """
+                  AND status = 'IN_PROGRESS'
+                  AND worker_id = ?
+                  AND fencing_token = ?
+                  AND workflow_id = ?
+                  AND step_key = ?
+                  AND lease_expires_at > NOW()
+                """ : """
                 UPDATE workflow_tasks
                 SET status = CASE WHEN attempt >= max_attempts THEN 'DEAD_LETTER' ELSE 'PENDING' END,
                     worker_id = NULL,
                     lease_expires_at = NULL,
                     next_run_at = DATEADD('SECOND', POWER(2, attempt), NOW())
                 WHERE task_id = ?
+                  AND status = 'IN_PROGRESS'
+                  AND worker_id = ?
+                  AND fencing_token = ?
+                  AND workflow_id = ?
+                  AND step_key = ?
+                  AND lease_expires_at > NOW()
                 """;
-
-            String selectVersionSql = "SELECT current_version FROM workflow_instances WHERE workflow_id = ? FOR UPDATE";
-            String updateVersionSql = "UPDATE workflow_instances SET current_version = current_version + 1, updated_at = NOW() WHERE workflow_id = ?";
-
-            String insertEventSql = """
-                INSERT INTO workflow_events (workflow_id, sequence_num, step_key, event_type, payload)
-                VALUES (?, ?, ?, ?, ?)
+        } else {
+            taskUpdateSql = success ? """
+                UPDATE workflow_tasks
+                SET status = 'COMPLETED', worker_id = NULL, lease_expires_at = NULL
+                WHERE task_id = ?
+                  AND status = 'IN_PROGRESS'
+                  AND worker_id = ?
+                  AND fencing_token = ?
+                  AND workflow_id = ?
+                  AND step_key = ?
+                  AND lease_expires_at > clock_timestamp()
+                """ : """
+                UPDATE workflow_tasks
+                SET status = CASE WHEN attempt >= max_attempts THEN 'DEAD_LETTER' ELSE 'PENDING' END,
+                    worker_id = NULL,
+                    lease_expires_at = NULL,
+                    next_run_at = NOW() + (POWER(2, attempt) * INTERVAL '1 second')
+                WHERE task_id = ?
+                  AND status = 'IN_PROGRESS'
+                  AND worker_id = ?
+                  AND fencing_token = ?
+                  AND workflow_id = ?
+                  AND step_key = ?
+                  AND lease_expires_at > clock_timestamp()
                 """;
+        }
 
-            try (Connection conn = dataSource.getConnection()) {
-                conn.setAutoCommit(false);
-                try {
-                    try (PreparedStatement verifyPs = conn.prepareStatement(verifyLeaseSql)) {
-                        verifyPs.setLong(1, taskId);
-                        verifyPs.setString(2, workerId);
-                        try (ResultSet rs = verifyPs.executeQuery()) {
-                            if (!rs.next()) {
-                                // Worker was fenced off (lease expired & reaped)
-                                conn.rollback();
-                                return false;
-                            }
-                        }
+        String selectVersionSql = "SELECT current_version FROM workflow_instances WHERE workflow_id = ? FOR UPDATE";
+        String updateVersionSql = "UPDATE workflow_instances SET current_version = current_version + 1, updated_at = NOW() WHERE workflow_id = ?";
+        String bumpVersionSql = """
+            UPDATE workflow_instances
+            SET current_version = current_version + 1, updated_at = NOW()
+            WHERE workflow_id = ?
+            RETURNING current_version
+            """;
+        String insertEventSql = isH2 ? """
+            INSERT INTO workflow_events (workflow_id, sequence_num, step_key, event_type, payload)
+            VALUES (?, ?, ?, ?, ?)
+            """ : """
+            INSERT INTO workflow_events (workflow_id, sequence_num, step_key, event_type, payload)
+            VALUES (?, ?, ?, ?, ?::jsonb)
+            """;
+
+        try (Connection conn = dataSource.getConnection()) {
+            conn.setAutoCommit(false);
+            try {
+                // The lease check and task transition are one conditional update. A rejected claim
+                // cannot append an event because the event write is in this same transaction.
+                try (PreparedStatement taskPs = conn.prepareStatement(taskUpdateSql)) {
+                    taskPs.setLong(1, taskId);
+                    taskPs.setString(2, workerId);
+                    taskPs.setLong(3, fencingToken);
+                    taskPs.setString(4, workflowId);
+                    taskPs.setString(5, stepKey);
+                    if (taskPs.executeUpdate() != 1) {
+                        conn.rollback();
+                        return false;
                     }
+                }
 
-                    long nextSeq;
+                long nextSeq;
+                if (isH2) {
                     try (PreparedStatement selPs = conn.prepareStatement(selectVersionSql);
                          PreparedStatement updPs = conn.prepareStatement(updateVersionSql)) {
                         selPs.setString(1, workflowId);
@@ -281,91 +337,15 @@ public class TaskQueueRepository {
                         updPs.setString(1, workflowId);
                         updPs.executeUpdate();
                     }
-
-                    String eventType = success ? "STEP_COMPLETED" : "STEP_FAILED";
-                    try (PreparedStatement eventPs = conn.prepareStatement(insertEventSql)) {
-                        eventPs.setString(1, workflowId);
-                        eventPs.setLong(2, nextSeq);
-                        eventPs.setString(3, stepKey);
-                        eventPs.setString(4, eventType);
-                        eventPs.setString(5, payloadJson);
-                        eventPs.executeUpdate();
-                    }
-
-                    String taskUpdateSql = success ? markCompletedSql : rescheduleSql;
-                    try (PreparedStatement taskPs = conn.prepareStatement(taskUpdateSql)) {
-                        taskPs.setLong(1, taskId);
-                        taskPs.executeUpdate();
-                    }
-
-                    conn.commit();
-                    return true;
-                } catch (SQLException ex) {
-                    conn.rollback();
-                    throw ex;
-                }
-            }
-        }
-
-        String verifyLeaseSql = """
-            SELECT attempt, max_attempts
-            FROM workflow_tasks
-            WHERE task_id = ?
-              AND worker_id = ?
-              AND status = 'IN_PROGRESS'
-            FOR UPDATE
-            """;
-
-        String markCompletedSql = """
-            UPDATE workflow_tasks
-            SET status = 'COMPLETED', lease_expires_at = NULL
-            WHERE task_id = ?
-            """;
-
-        String rescheduleSql = """
-            UPDATE workflow_tasks
-            SET status = CASE WHEN attempt >= max_attempts THEN 'DEAD_LETTER' ELSE 'PENDING' END,
-                worker_id = NULL,
-                lease_expires_at = NULL,
-                next_run_at = NOW() + (POWER(2, attempt) * INTERVAL '1 second')
-            WHERE task_id = ?
-            """;
-
-        String bumpVersionSql = """
-            UPDATE workflow_instances
-            SET current_version = current_version + 1, updated_at = NOW()
-            WHERE workflow_id = ?
-            RETURNING current_version
-            """;
-
-        String insertEventSql = """
-            INSERT INTO workflow_events (workflow_id, sequence_num, step_key, event_type, payload)
-            VALUES (?, ?, ?, ?, ?::jsonb)
-            """;
-
-        try (Connection conn = dataSource.getConnection()) {
-            conn.setAutoCommit(false);
-            try {
-                try (PreparedStatement verifyPs = conn.prepareStatement(verifyLeaseSql)) {
-                    verifyPs.setLong(1, taskId);
-                    verifyPs.setString(2, workerId);
-                    try (ResultSet rs = verifyPs.executeQuery()) {
-                        if (!rs.next()) {
-                            // Worker was fenced off (lease expired & reaped)
-                            conn.rollback();
-                            return false;
+                } else {
+                    try (PreparedStatement bumpPs = conn.prepareStatement(bumpVersionSql)) {
+                        bumpPs.setString(1, workflowId);
+                        try (ResultSet rs = bumpPs.executeQuery()) {
+                            if (!rs.next()) {
+                                throw new IllegalStateException("Workflow instance missing: " + workflowId);
+                            }
+                            nextSeq = rs.getLong(1);
                         }
-                    }
-                }
-
-                long nextSeq;
-                try (PreparedStatement bumpPs = conn.prepareStatement(bumpVersionSql)) {
-                    bumpPs.setString(1, workflowId);
-                    try (ResultSet rs = bumpPs.executeQuery()) {
-                        if (!rs.next()) {
-                            throw new IllegalStateException("Workflow instance missing: " + workflowId);
-                        }
-                        nextSeq = rs.getLong(1);
                     }
                 }
 
@@ -377,12 +357,6 @@ public class TaskQueueRepository {
                     eventPs.setString(4, eventType);
                     eventPs.setString(5, payloadJson);
                     eventPs.executeUpdate();
-                }
-
-                String taskUpdateSql = success ? markCompletedSql : rescheduleSql;
-                try (PreparedStatement taskPs = conn.prepareStatement(taskUpdateSql)) {
-                    taskPs.setLong(1, taskId);
-                    taskPs.executeUpdate();
                 }
 
                 conn.commit();

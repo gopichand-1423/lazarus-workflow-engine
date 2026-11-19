@@ -34,12 +34,14 @@ message PollTaskResponse {
   string step_key = 4;
   string input_json = 5;
   int32 attempt = 6;
+  int64 fencing_token = 7;
 }
 
 message HeartbeatRequest {
   int64 task_id = 1;
   string worker_id = 2;
   int32 extend_seconds = 3;
+  int64 fencing_token = 4;
 }
 
 message HeartbeatResponse {
@@ -53,8 +55,10 @@ message CompleteTaskRequest {
   string worker_id = 4;
   bool success = 5;
   string payload_json = 6;
+  int64 fencing_token = 7;
 }
 
 message CompleteTaskResponse {
   bool committed = 1;
+  string rejection_reason = 2;
 }

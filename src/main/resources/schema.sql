@@ -32,10 +32,15 @@ CREATE TABLE workflow_tasks (
     status VARCHAR(32) NOT NULL DEFAULT 'PENDING', -- PENDING, IN_PROGRESS, COMPLETED, DEAD_LETTER
     worker_id VARCHAR(128),
     attempt INT NOT NULL DEFAULT 0,
+    fencing_token BIGINT NOT NULL DEFAULT 0,
     max_attempts INT NOT NULL DEFAULT 5,
     lease_expires_at TIMESTAMP WITH TIME ZONE,
     next_run_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
     UNIQUE (workflow_id, step_key)
 );
+
+-- Upgrade existing local databases as well as creating fresh schemas.
+ALTER TABLE workflow_tasks
+    ADD COLUMN IF NOT EXISTS fencing_token BIGINT NOT NULL DEFAULT 0;
 
 CREATE INDEX idx_tasks_poll ON workflow_tasks (status, next_run_at, lease_expires_at);

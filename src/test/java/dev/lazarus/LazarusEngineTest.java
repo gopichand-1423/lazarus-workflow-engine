@@ -12,7 +12,11 @@ import org.junit.jupiter.api.*;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.sql.Connection;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
 import java.sql.Statement;
+import java.sql.Timestamp;
+import java.time.Instant;
 import java.util.*;
 import java.util.concurrent.Callable;
 import java.util.concurrent.Future;
@@ -172,6 +176,103 @@ class LazarusEngineTest {
         System.out.printf("[BENCHMARK] 200 Concurrent Workflows (400 Durable Steps) | Live Exec: %.2f ms | Full Replay: %.2f ms%n",
                 execMs, replayMs);
         assertTrue(replayMs < execMs, "Cached deterministic replay should be faster than live step persistence");
+    }
+
+    @Test
+    @DisplayName("5. Expired lease cannot complete before the zombie reaper runs")
+    void testExpiredLeaseCannotCompleteBeforeReaper() throws Exception {
+        String wfId = "test-expired-lease-" + UUID.randomUUID();
+        eventStore.createWorkflowInstance(wfId, "lease-fencing", "{}");
+        taskQueue.enqueueTask(wfId, "step-expired", 5);
+        ClaimedTask claim = taskQueue.pollNextTask("worker-expired", 30).orElseThrow();
+
+        markLeaseExpired(claim.taskId());
+
+        assertFalse(taskQueue.completeTask(
+                claim.taskId(), wfId, "step-expired", "worker-expired", claim.fencingToken(), true, "{}"));
+        assertEquals(0, countEvents(wfId, "step-expired", "STEP_COMPLETED"));
+        taskQueue.reapZombieTasks(10);
+    }
+
+    @Test
+    @DisplayName("6. A previous claim token is fenced after the same worker reclaims the task")
+    void testOlderFencingTokenRejectedAfterSameWorkerReclaims() throws Exception {
+        String wfId = "test-reclaimed-lease-" + UUID.randomUUID();
+        eventStore.createWorkflowInstance(wfId, "lease-fencing", "{}");
+        taskQueue.enqueueTask(wfId, "step-reclaimed", 5);
+        String workerId = "worker-reclaimed";
+        ClaimedTask firstClaim = taskQueue.pollNextTask(workerId, 30).orElseThrow();
+
+        markLeaseExpired(firstClaim.taskId());
+        ReapSummary reaped = taskQueue.reapZombieTasks(10);
+        assertTrue(reaped.rescheduledCount() >= 1);
+        makeTaskImmediatelyAvailable(firstClaim.taskId());
+
+        ClaimedTask secondClaim = taskQueue.pollNextTask(workerId, 30).orElseThrow();
+        assertTrue(secondClaim.fencingToken() > firstClaim.fencingToken());
+        assertFalse(taskQueue.extendLease(
+                secondClaim.taskId(), workerId, firstClaim.fencingToken(), 30));
+        assertTrue(taskQueue.extendLease(
+                secondClaim.taskId(), workerId, secondClaim.fencingToken(), 30));
+
+        assertFalse(taskQueue.completeTask(
+                firstClaim.taskId(), wfId, "step-reclaimed", workerId, firstClaim.fencingToken(), true, "{\"old\":true}"));
+        assertEquals(0, countEvents(wfId, "step-reclaimed", "STEP_COMPLETED"));
+        assertTrue(taskQueue.completeTask(
+                secondClaim.taskId(), wfId, "step-reclaimed", workerId, secondClaim.fencingToken(), true, "{\"new\":true}"));
+        assertEquals(1, countEvents(wfId, "step-reclaimed", "STEP_COMPLETED"));
+    }
+
+    @Test
+    @DisplayName("7. Completion rejects workflow ID and step key values that do not match the task")
+    void testCompletionRejectsMismatchedWorkflowAndStep() throws Exception {
+        String wfId = "test-task-identity-" + UUID.randomUUID();
+        String otherWfId = "test-task-identity-other-" + UUID.randomUUID();
+        eventStore.createWorkflowInstance(wfId, "lease-fencing", "{}");
+        eventStore.createWorkflowInstance(otherWfId, "lease-fencing", "{}");
+        taskQueue.enqueueTask(wfId, "step-identity", 5);
+        ClaimedTask claim = taskQueue.pollNextTask("worker-identity", 30).orElseThrow();
+
+        assertFalse(taskQueue.completeTask(
+                claim.taskId(), otherWfId, "step-identity", "worker-identity", claim.fencingToken(), true, "{}"));
+        assertFalse(taskQueue.completeTask(
+                claim.taskId(), wfId, "different-step", "worker-identity", claim.fencingToken(), true, "{}"));
+        assertEquals(0, countEvents(wfId, "step-identity", "STEP_COMPLETED"));
+        assertEquals(0, countEvents(otherWfId, "step-identity", "STEP_COMPLETED"));
+
+        assertTrue(taskQueue.completeTask(
+                claim.taskId(), wfId, "step-identity", "worker-identity", claim.fencingToken(), true, "{}"));
+        assertEquals(1, countEvents(wfId, "step-identity", "STEP_COMPLETED"));
+    }
+
+    private static void markLeaseExpired(long taskId) throws Exception {
+        String sql = "UPDATE workflow_tasks SET lease_expires_at = ? WHERE task_id = ?";
+        try (Connection conn = dataSource.getConnection(); PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setTimestamp(1, Timestamp.from(Instant.now().minusSeconds(10)));
+            ps.setLong(2, taskId);
+            assertEquals(1, ps.executeUpdate());
+        }
+    }
+
+    private static void makeTaskImmediatelyAvailable(long taskId) throws Exception {
+        String sql = "UPDATE workflow_tasks SET next_run_at = NOW() WHERE task_id = ? AND status = 'PENDING'";
+        try (Connection conn = dataSource.getConnection(); PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setLong(1, taskId);
+            assertEquals(1, ps.executeUpdate());
+        }
+    }
+
+    private static long countEvents(String workflowId, String stepKey, String eventType) throws Exception {
+        String sql = "SELECT COUNT(*) FROM workflow_events WHERE workflow_id = ? AND step_key = ? AND event_type = ?";
+        try (Connection conn = dataSource.getConnection(); PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setString(1, workflowId);
+            ps.setString(2, stepKey);
+            ps.setString(3, eventType);
+            try (ResultSet rs = ps.executeQuery()) {
+                assertTrue(rs.next());
+                return rs.getLong(1);
+            }
+        }
     }
 
     @Test

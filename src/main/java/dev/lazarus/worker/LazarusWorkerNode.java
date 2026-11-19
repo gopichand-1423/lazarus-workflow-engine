@@ -93,6 +93,7 @@ public class LazarusWorkerNode implements AutoCloseable {
                                     .setTaskId(task.getTaskId())
                                     .setWorkerId(workerId)
                                     .setExtendSeconds(leaseDurationSeconds)
+                                    .setFencingToken(task.getFencingToken())
                                     .build());
 
                             if (!hb.getLeaseValid()) {
@@ -117,14 +118,19 @@ public class LazarusWorkerNode implements AutoCloseable {
             heartbeatThread.interrupt();
 
             if (!fencedOff.get()) {
-                stub.completeTask(CompleteTaskRequest.newBuilder()
+                CompleteTaskResponse completion = stub.completeTask(CompleteTaskRequest.newBuilder()
                         .setTaskId(task.getTaskId())
                         .setWorkflowId(task.getWorkflowId())
                         .setStepKey(task.getStepKey())
                         .setWorkerId(workerId)
                         .setSuccess(true)
                         .setPayloadJson(outputJson)
+                        .setFencingToken(task.getFencingToken())
                         .build());
+                if (!completion.getCommitted()) {
+                    System.err.printf("[FENCED] Completion rejected for task %d: %s%n",
+                            task.getTaskId(), completion.getRejectionReason());
+                }
             }
         } catch (Exception ex) {
             active.set(false);
@@ -132,14 +138,19 @@ public class LazarusWorkerNode implements AutoCloseable {
 
             if (!fencedOff.get()) {
                 String errorJson = "{\"error\":\"" + ex.getMessage().replace("\"", "'") + "\"}";
-                stub.completeTask(CompleteTaskRequest.newBuilder()
+                CompleteTaskResponse completion = stub.completeTask(CompleteTaskRequest.newBuilder()
                         .setTaskId(task.getTaskId())
                         .setWorkflowId(task.getWorkflowId())
                         .setStepKey(task.getStepKey())
                         .setWorkerId(workerId)
                         .setSuccess(false)
                         .setPayloadJson(errorJson)
+                        .setFencingToken(task.getFencingToken())
                         .build());
+                if (!completion.getCommitted()) {
+                    System.err.printf("[FENCED] Failure report rejected for task %d: %s%n",
+                            task.getTaskId(), completion.getRejectionReason());
+                }
             }
         }
     }

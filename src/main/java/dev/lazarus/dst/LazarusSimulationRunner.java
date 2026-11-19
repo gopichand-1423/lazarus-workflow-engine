@@ -109,12 +109,14 @@ public class LazarusSimulationRunner {
 
         ClaimedTask claimB = taskQueue.pollNextTask("worker-B-healthy", 10).orElseThrow();
         boolean committedB = taskQueue.completeTask(
-                claimB.taskId(), wfId, "debit-account", "worker-B-healthy", true, "{\"txId\":\"TX-900\"}");
+                claimB.taskId(), wfId, "debit-account", "worker-B-healthy", claimB.fencingToken(),
+                true, "{\"txId\":\"TX-900\"}");
         System.out.printf("3. Worker-B claimed taskId=%d (attempt=%d) and committed -> success=%b%n",
                 claimB.taskId(), claimB.attempt(), committedB);
 
         boolean committedA = taskQueue.completeTask(
-                claimA.taskId(), wfId, "debit-account", "worker-A-zombie", true, "{\"txId\":\"DUPLICATE-TX\"}");
+                claimA.taskId(), wfId, "debit-account", "worker-A-zombie", claimA.fencingToken(),
+                true, "{\"txId\":\"DUPLICATE-TX\"}");
         System.out.printf("4. Zombie Worker-A attempted stale commit -> committed=%b (MUST BE FALSE)%n", committedA);
 
         if (committedA || !committedB) {
