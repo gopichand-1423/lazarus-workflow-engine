@@ -2,6 +2,7 @@ package dev.lazarus.dst;
 
 import com.zaxxer.hikari.HikariConfig;
 import com.zaxxer.hikari.HikariDataSource;
+import dev.lazarus.config.LazarusDatabaseMigrations;
 import dev.lazarus.engine.LazarusEngine;
 import dev.lazarus.engine.WorkflowDefinitionRegistry;
 import dev.lazarus.engine.ZombieWorkerReaper;
@@ -14,10 +15,6 @@ import dev.lazarus.workflow.InMemoryPaymentGateway;
 import dev.lazarus.workflow.InMemoryShippingService;
 import dev.lazarus.workflow.PaymentSagaWorkflow;
 
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.sql.Connection;
-import java.sql.Statement;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
@@ -39,17 +36,23 @@ public final class LazarusSimulationRunner {
     public static void main(String[] args) throws Exception {
         long seed = args.length > 0 ? Long.parseLong(args[0]) : 42024L;
         HikariConfig config = new HikariConfig();
+        String databaseMode = System.getenv().getOrDefault("LAZARUS_DB_MODE", "h2").trim().toLowerCase(java.util.Locale.ROOT);
+        if (!"h2".equals(databaseMode) && !"postgresql".equals(databaseMode)) {
+            throw new IllegalArgumentException("LAZARUS_DB_MODE must be 'postgresql' or 'h2'");
+        }
         String explicitUrl = System.getenv("LAZARUS_DB_URL");
-        boolean useDefaultH2 = explicitUrl == null || explicitUrl.isBlank();
-        config.setJdbcUrl(useDefaultH2
+        String defaultUrl = "h2".equals(databaseMode)
                 ? "jdbc:h2:mem:lazarus_dst_" + seed + ";MODE=PostgreSQL;DATABASE_TO_LOWER=TRUE;DEFAULT_NULL_ORDERING=HIGH;DB_CLOSE_DELAY=-1"
-                : explicitUrl);
-        config.setUsername(System.getenv().getOrDefault("LAZARUS_DB_USER", useDefaultH2 ? "sa" : "lazarus"));
-        config.setPassword(System.getenv().getOrDefault("LAZARUS_DB_PASS", useDefaultH2 ? "" : "lazarus_password"));
+                : "jdbc:postgresql://localhost:5432/lazarus_db";
+        config.setJdbcUrl(explicitUrl == null || explicitUrl.isBlank() ? defaultUrl : explicitUrl);
+        boolean h2 = "h2".equals(databaseMode);
+        config.setUsername(System.getenv().getOrDefault("LAZARUS_DB_USER", h2 ? "sa" : "lazarus"));
+        config.setPassword(System.getenv().getOrDefault("LAZARUS_DB_PASS", h2 ? "" : "lazarus_password"));
+        config.setInitializationFailTimeout(5_000);
         config.setMaximumPoolSize(10);
 
         try (HikariDataSource ds = new HikariDataSource(config)) {
-            ensureSchemaInitialized(ds);
+            LazarusDatabaseMigrations.migrate(ds, databaseMode);
             SimulationTrace trace = runDeterministicSimulation(seed, ds);
             System.out.println("==========================================================");
             System.out.println(" LAZARUS JAVA 24 - DETERMINISTIC SIMULATION HARNESS (DST)");
@@ -177,13 +180,4 @@ public final class LazarusSimulationRunner {
                 + event.stepOrdinal() + ":" + event.stepKey() + ":" + event.eventType() + ":" + event.payloadJson()));
     }
 
-    private static void ensureSchemaInitialized(HikariDataSource ds) throws Exception {
-        String schemaSql = Files.readString(Path.of("src/main/resources/schema.sql"))
-                .replace("CREATE TABLE ", "CREATE TABLE IF NOT EXISTS ")
-                .replace("CREATE INDEX ", "CREATE INDEX IF NOT EXISTS ")
-                .replace("TIMESTAMPTZ", "TIMESTAMP WITH TIME ZONE");
-        try (Connection conn = ds.getConnection(); Statement stmt = conn.createStatement()) {
-            stmt.execute(schemaSql);
-        }
-    }
 }

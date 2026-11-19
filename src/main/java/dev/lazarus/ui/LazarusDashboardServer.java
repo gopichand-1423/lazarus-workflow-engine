@@ -5,23 +5,24 @@ import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
 import com.zaxxer.hikari.HikariConfig;
 import com.zaxxer.hikari.HikariDataSource;
+import dev.lazarus.config.LazarusDatabaseMigrations;
 import dev.lazarus.engine.LazarusEngine;
 import dev.lazarus.store.EventStoreRepository;
 import dev.lazarus.store.TaskQueueRepository;
+import dev.lazarus.workflow.StepContext;
 
 import javax.sql.DataSource;
+import java.io.IOException;
 import java.io.OutputStream;
+import java.net.InetAddress;
 import java.net.InetSocketAddress;
-import java.net.Socket;
 import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
-import java.nio.file.Path;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
-import java.sql.Statement;
 import java.util.*;
 import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
 public class LazarusDashboardServer {
@@ -29,18 +30,48 @@ public class LazarusDashboardServer {
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
     public static void main(String[] args) throws Exception {
-        HikariDataSource ds = createDataSourceWithFallback();
-        ensureSchemaInitialized(ds);
+        String databaseMode = System.getenv().getOrDefault("LAZARUS_DB_MODE", "postgresql").trim().toLowerCase(Locale.ROOT);
+        HikariDataSource ds = createDataSource(databaseMode);
+        LazarusEngine engine = null;
+        HttpServer server = null;
+        ExecutorService httpExecutor = null;
+        try {
+            LazarusDatabaseMigrations.migrate(ds, databaseMode);
 
-        EventStoreRepository eventStore = new EventStoreRepository(ds);
-        TaskQueueRepository taskQueue = new TaskQueueRepository(ds);
-        LazarusEngine engine = new LazarusEngine(eventStore);
+            EventStoreRepository eventStore = new EventStoreRepository(ds);
+            TaskQueueRepository taskQueue = new TaskQueueRepository(ds);
+            engine = new LazarusEngine(eventStore);
+            int port = Integer.parseInt(System.getenv().getOrDefault("LAZARUS_PORT", "8080"));
+            String bindAddress = System.getenv().getOrDefault("LAZARUS_BIND_ADDRESS", "127.0.0.1");
+            server = HttpServer.create(new InetSocketAddress(InetAddress.getByName(bindAddress), port), 0);
+            httpExecutor = Executors.newVirtualThreadPerTaskExecutor();
+            server.setExecutor(httpExecutor);
+            registerContexts(server, ds, eventStore, taskQueue, engine);
+            server.start();
 
-        int port = Integer.parseInt(System.getenv().getOrDefault("LAZARUS_PORT", "8080"));
-        HttpServer server = HttpServer.create(new InetSocketAddress(port), 0);
-        server.setExecutor(Executors.newVirtualThreadPerTaskExecutor());
+            HttpServer activeServer = server;
+            ExecutorService activeExecutor = httpExecutor;
+            LazarusEngine activeEngine = engine;
+            Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+                activeServer.stop(1);
+                activeExecutor.close();
+                activeEngine.close();
+                ds.close();
+            }, "lazarus-dashboard-shutdown"));
+            System.out.println("[LAZARUS-UI] Dashboard listening at http://" + bindAddress + ":" + server.getAddress().getPort());
+        } catch (Exception ex) {
+            if (server != null) server.stop(0);
+            if (httpExecutor != null) httpExecutor.close();
+            if (engine != null) engine.close();
+            ds.close();
+            throw ex;
+        }
+    }
 
+    static void registerContexts(HttpServer server, DataSource ds, EventStoreRepository eventStore,
+                                TaskQueueRepository taskQueue, LazarusEngine engine) {
         server.createContext("/api/events", exchange -> {
+            if (!requireMethod(exchange, "GET")) return;
             try {
                 List<Map<String, Object>> events = fetchAllEvents(ds);
                 sendJson(exchange, 200, MAPPER.writeValueAsString(events));
@@ -52,6 +83,7 @@ public class LazarusDashboardServer {
         });
 
         server.createContext("/api/tasks", exchange -> {
+            if (!requireMethod(exchange, "GET")) return;
             try {
                 sendJson(exchange, 200, MAPPER.writeValueAsString(taskQueue.listTasks()));
             } catch (Exception ex) {
@@ -62,11 +94,15 @@ public class LazarusDashboardServer {
         });
 
         server.createContext("/api/dlq/simulate", exchange -> {
+            if (!requireMethod(exchange, "POST")) return;
             try {
                 String wfId = "wf-dlq-" + UUID.randomUUID().toString().substring(0, 6);
+                String stepKey = "3-dispatch-shipment";
                 eventStore.createWorkflowInstance(wfId, "poison-pill-workflow", "{\"reason\":\"gateway_timeout\"}");
-                eventStore.appendEvent(wfId, "3-dispatch-shipment", "STEP_FAILED", "{\"error\":\"MAX_RETRIES_EXCEEDED (5/5)\"}");
-                taskQueue.seedDeadLetterTask(wfId, "3-dispatch-shipment");
+                eventStore.appendStepEvent(wfId, stepKey, "STEP_FAILED",
+                        "{\"error\":\"MAX_RETRIES_EXCEEDED (5/5)\"}", 0,
+                        StepContext.idempotencyKey(wfId, 0, stepKey));
+                taskQueue.seedDeadLetterTask(wfId, stepKey);
                 sendJson(exchange, 200, MAPPER.writeValueAsString(Map.of("seededWorkflowId", wfId, "status", "DEAD_LETTER")));
             } catch (Exception ex) {
                 try {
@@ -76,6 +112,7 @@ public class LazarusDashboardServer {
         });
 
         server.createContext("/api/dlq/replay", exchange -> {
+            if (!requireMethod(exchange, "POST")) return;
             try {
                 int replayed = taskQueue.replayDeadLetterTasks();
                 sendJson(exchange, 200, MAPPER.writeValueAsString(Map.of("replayedCount", replayed)));
@@ -87,6 +124,7 @@ public class LazarusDashboardServer {
         });
 
         server.createContext("/api/trigger", exchange -> {
+            if (!requireMethod(exchange, "POST")) return;
             try {
                 String query = Optional.ofNullable(exchange.getRequestURI().getQuery()).orElse("");
                 String wfId = Arrays.stream(query.split("&"))
@@ -130,6 +168,7 @@ public class LazarusDashboardServer {
         });
 
         server.createContext("/", exchange -> {
+            if (!requireMethod(exchange, "GET")) return;
             byte[] html = DASHBOARD_HTML.getBytes(StandardCharsets.UTF_8);
             exchange.getResponseHeaders().set("Content-Type", "text/html; charset=UTF-8");
             exchange.sendResponseHeaders(200, html.length);
@@ -137,41 +176,38 @@ public class LazarusDashboardServer {
                 os.write(html);
             }
         });
-
-        server.start();
-        System.out.println("[LAZARUS-UI] Interactive DAG & DLQ Control Plane live at http://localhost:" + port);
     }
 
-    private static boolean isPortReachable(String host, int port, int timeoutMs) {
-        try (Socket socket = new Socket()) {
-            socket.connect(new InetSocketAddress(host, port), timeoutMs);
-            return true;
-        } catch (Exception e) {
-            return false;
-        }
+    private static boolean requireMethod(HttpExchange exchange, String allowedMethod) throws IOException {
+        if (allowedMethod.equalsIgnoreCase(exchange.getRequestMethod())) return true;
+        exchange.getResponseHeaders().set("Allow", allowedMethod);
+        sendJson(exchange, 405, MAPPER.writeValueAsString(Map.of("error", "Method Not Allowed")));
+        return false;
     }
 
-    private static HikariDataSource createDataSourceWithFallback() {
-        if (isPortReachable("localhost", 5432, 1000)) {
-            try {
-                HikariConfig pgConfig = new HikariConfig();
-                pgConfig.setJdbcUrl(System.getenv().getOrDefault("LAZARUS_DB_URL", "jdbc:postgresql://localhost:5432/lazarus_db"));
-                pgConfig.setUsername(System.getenv().getOrDefault("LAZARUS_DB_USER", "lazarus"));
-                pgConfig.setPassword(System.getenv().getOrDefault("LAZARUS_DB_PASS", "lazarus_password"));
-                pgConfig.setConnectionTimeout(1500);
-                pgConfig.setMaximumPoolSize(10);
-                return new HikariDataSource(pgConfig);
-            } catch (Exception ex) {
-                // fallback below
-            }
+    static HikariDataSource createDataSource(String databaseMode) {
+        if (!"postgresql".equals(databaseMode) && !"h2".equals(databaseMode)) {
+            throw new IllegalArgumentException("LAZARUS_DB_MODE must be 'postgresql' or 'h2'");
         }
-        System.out.println("[LAZARUS-UI] PostgreSQL on 5432 not reachable, falling back to in-memory H2 (PostgreSQL mode)...");
-        HikariConfig h2Config = new HikariConfig();
-        h2Config.setJdbcUrl("jdbc:h2:mem:lazarus_ui;MODE=PostgreSQL;DATABASE_TO_LOWER=TRUE;DEFAULT_NULL_ORDERING=HIGH;DB_CLOSE_DELAY=-1");
-        h2Config.setUsername("lazarus");
-        h2Config.setPassword("lazarus_password");
-        h2Config.setMaximumPoolSize(10);
-        return new HikariDataSource(h2Config);
+        boolean h2 = "h2".equals(databaseMode);
+        HikariConfig config = new HikariConfig();
+        String defaultUrl = h2
+                ? "jdbc:h2:mem:lazarus_ui;MODE=PostgreSQL;DATABASE_TO_LOWER=TRUE;DEFAULT_NULL_ORDERING=HIGH;DB_CLOSE_DELAY=-1"
+                : "jdbc:postgresql://localhost:5432/lazarus_db";
+        config.setJdbcUrl(System.getenv().getOrDefault("LAZARUS_DB_URL", defaultUrl));
+        config.setUsername(System.getenv().getOrDefault("LAZARUS_DB_USER", h2 ? "sa" : "lazarus"));
+        config.setPassword(System.getenv().getOrDefault("LAZARUS_DB_PASS", h2 ? "" : "lazarus_password"));
+        config.setConnectionTimeout(5_000);
+        config.setInitializationFailTimeout(5_000);
+        config.setMaximumPoolSize(10);
+        try {
+            return new HikariDataSource(config);
+        } catch (RuntimeException ex) {
+            String modeHelp = h2
+                    ? "Check the configured H2 URL and credentials."
+                    : "Start PostgreSQL or explicitly select local H2 with LAZARUS_DB_MODE=h2.";
+            throw new IllegalStateException("Unable to connect to configured " + databaseMode + " database. " + modeHelp, ex);
+        }
     }
 
     private static List<Map<String, Object>> fetchAllEvents(DataSource ds) throws Exception {
@@ -209,19 +245,7 @@ public class LazarusDashboardServer {
         return list;
     }
 
-    private static void ensureSchemaInitialized(HikariDataSource ds) throws Exception {
-        Path p = Path.of("src/main/resources/schema.sql");
-        if (!Files.exists(p)) return;
-        String schemaSql = Files.readString(p)
-                .replace("CREATE TABLE ", "CREATE TABLE IF NOT EXISTS ")
-                .replace("CREATE INDEX ", "CREATE INDEX IF NOT EXISTS ")
-                .replace("TIMESTAMPTZ", "TIMESTAMP WITH TIME ZONE");
-        try (Connection conn = ds.getConnection(); Statement stmt = conn.createStatement()) {
-            stmt.execute(schemaSql);
-        }
-    }
-
-    private static void sendJson(HttpExchange exchange, int code, String json) throws Exception {
+    private static void sendJson(HttpExchange exchange, int code, String json) throws IOException {
         byte[] bytes = json.getBytes(StandardCharsets.UTF_8);
         exchange.getResponseHeaders().set("Content-Type", "application/json; charset=UTF-8");
         exchange.sendResponseHeaders(code, bytes.length);
@@ -274,7 +298,7 @@ public class LazarusDashboardServer {
           <div class="controls">
             <input id="wfId" value="order-dag-901" placeholder="Workflow ID" />
             <button class="crash" onclick="runWorkflow(true)">1. Run & Inject Crash at Step 3</button>
-            <button class="replay" onclick="runWorkflow(false)">2. Resume & Deterministic Replay (0ms Skip)</button>
+            <button class="replay" onclick="runWorkflow(false)">2. Resume & Deterministic Replay</button>
             <button class="dlq-sim" onclick="simulateDlq()">3. Simulate Poison-Pill Task (DLQ)</button>
             <button class="dlq-btn" onclick="replayDlq()">4. 1-Click Replay Dead-Letter Queue</button>
           </div>
@@ -321,6 +345,14 @@ public class LazarusDashboardServer {
 
           <script>
             const DAG_STEPS = ['1-validate-order', '2a-reserve-inventory', '2b-charge-payment', '2c-fraud-check', '3-dispatch-shipment'];
+            const STATE_CLASSES = new Set(['STEP_COMPLETED', 'COMPLETED', 'STEP_FAILED', 'DEAD_LETTER', 'STEP_STARTED', 'WORKFLOW_STARTED', 'PENDING']);
+
+            function appendTextCell(row, value, stateClass = null) {
+              const cell = document.createElement('td');
+              cell.textContent = value == null ? '' : String(value);
+              if (stateClass && STATE_CLASSES.has(stateClass)) cell.classList.add(stateClass);
+              row.appendChild(cell);
+            }
 
             async function refreshAll() {
               const wfId = document.getElementById('wfId').value;
@@ -340,39 +372,41 @@ public class LazarusDashboardServer {
                 else if (failed) el.classList.add('failed');
               });
 
-              document.getElementById('eventsBody').innerHTML = events.map(e => `
-                <tr>
-                  <td>#${e.eventId}</td>
-                  <td>${e.workflowId}</td>
-                  <td>${e.seq}</td>
-                  <td>${e.stepKey}</td>
-                  <td class="${e.eventType}">${e.eventType}</td>
-                  <td>${e.payload}</td>
-                </tr>
-              `).join('');
+              const eventRows = events.map(e => {
+                const row = document.createElement('tr');
+                appendTextCell(row, `#${e.eventId}`);
+                appendTextCell(row, e.workflowId);
+                appendTextCell(row, e.seq);
+                appendTextCell(row, e.stepKey);
+                appendTextCell(row, e.eventType, e.eventType);
+                appendTextCell(row, e.payload);
+                return row;
+              });
+              document.getElementById('eventsBody').replaceChildren(...eventRows);
 
-              document.getElementById('tasksBody').innerHTML = tasks.map(t => `
-                <tr>
-                  <td>#${t.taskId}</td>
-                  <td>${t.workflowId}</td>
-                  <td>${t.stepKey}</td>
-                  <td class="${t.status}">${t.status}</td>
-                  <td>${t.attempt}/${t.maxAttempts}</td>
-                </tr>
-              `).join('');
+              const taskRows = tasks.map(t => {
+                const row = document.createElement('tr');
+                appendTextCell(row, `#${t.taskId}`);
+                appendTextCell(row, t.workflowId);
+                appendTextCell(row, t.stepKey);
+                appendTextCell(row, t.status, t.status);
+                appendTextCell(row, `${t.attempt}/${t.maxAttempts}`);
+                return row;
+              });
+              document.getElementById('tasksBody').replaceChildren(...taskRows);
             }
 
             async function runWorkflow(crash) {
               const wfId = document.getElementById('wfId').value;
               document.getElementById('statusMsg').textContent = 'Executing workflow ' + wfId + '...';
-              const res = await fetch(`/api/trigger?wfId=${encodeURIComponent(wfId)}&crash=${crash}`);
+              const res = await fetch(`/api/trigger?wfId=${encodeURIComponent(wfId)}&crash=${crash}`, { method: 'POST' });
               const out = await res.json();
               document.getElementById('statusMsg').textContent = `${out.workflowId}: ${out.status}`;
               refreshAll();
             }
 
             async function simulateDlq() {
-              const res = await fetch('/api/dlq/simulate');
+              const res = await fetch('/api/dlq/simulate', { method: 'POST' });
               const out = await res.json();
               document.getElementById('wfId').value = out.seededWorkflowId;
               document.getElementById('statusMsg').textContent = `Seeded DEAD_LETTER task for ${out.seededWorkflowId}`;
@@ -380,7 +414,7 @@ public class LazarusDashboardServer {
             }
 
             async function replayDlq() {
-              const res = await fetch('/api/dlq/replay');
+              const res = await fetch('/api/dlq/replay', { method: 'POST' });
               const out = await res.json();
               document.getElementById('statusMsg').textContent = `Replayed ${out.replayedCount} DEAD_LETTER task(s) -> PENDING`;
               refreshAll();

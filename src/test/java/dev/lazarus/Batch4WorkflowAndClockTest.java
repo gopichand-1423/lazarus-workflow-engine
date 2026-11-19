@@ -2,6 +2,7 @@ package dev.lazarus;
 
 import com.zaxxer.hikari.HikariConfig;
 import com.zaxxer.hikari.HikariDataSource;
+import dev.lazarus.config.LazarusDatabaseMigrations;
 import dev.lazarus.dst.DeterministicChaosClock;
 import dev.lazarus.dst.LazarusSimulationRunner;
 import dev.lazarus.engine.LazarusEngine;
@@ -18,12 +19,9 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
-import java.nio.file.Files;
-import java.nio.file.Path;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
-import java.sql.Statement;
 import java.time.Duration;
 import java.util.List;
 import java.util.UUID;
@@ -222,12 +220,7 @@ class Batch4WorkflowAndClockTest {
     }
 
     private static void initializeSchema(HikariDataSource ds) throws Exception {
-        String sql = Files.readString(Path.of("src/main/resources/schema.sql"))
-                .replace("CREATE TABLE ", "CREATE TABLE IF NOT EXISTS ")
-                .replace("CREATE INDEX ", "CREATE INDEX IF NOT EXISTS ");
-        try (Connection conn = ds.getConnection(); Statement statement = conn.createStatement()) {
-            statement.execute(sql);
-        }
+        LazarusDatabaseMigrations.migrate(ds, "h2");
     }
 
 }

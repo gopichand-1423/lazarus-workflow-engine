@@ -19,6 +19,7 @@ import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 
 import javax.sql.DataSource;
+import java.sql.SQLException;
 import java.time.Duration;
 import java.time.Clock;
 import java.util.List;
@@ -33,12 +34,22 @@ public class LazarusConfiguration {
     }
 
     @Bean
-    EventStoreRepository eventStoreRepository(DataSource dataSource, Clock lazarusClock) {
+    LazarusDatabaseMode lazarusDatabaseMode(
+            DataSource dataSource,
+            @Value("${lazarus.database.mode:postgresql}") String databaseMode
+    ) throws SQLException {
+        return LazarusDatabaseMode.validate(dataSource, databaseMode);
+    }
+
+    @Bean
+    EventStoreRepository eventStoreRepository(DataSource dataSource, Clock lazarusClock,
+                                              LazarusDatabaseMode ignoredDatabaseMode) {
         return new EventStoreRepository(dataSource, lazarusClock);
     }
 
     @Bean
-    TaskQueueRepository taskQueueRepository(DataSource dataSource, Clock lazarusClock) {
+    TaskQueueRepository taskQueueRepository(DataSource dataSource, Clock lazarusClock,
+                                            LazarusDatabaseMode ignoredDatabaseMode) {
         return new TaskQueueRepository(dataSource, lazarusClock);
     }
 

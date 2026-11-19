@@ -121,6 +121,14 @@ class LazarusGrpcIntegrationTest {
     }
 
     @Test
+    void h2ProfileAppliesVersionedCommonMigrations() {
+        Integer applied = jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM flyway_schema_history WHERE success = TRUE AND version IN ('1', '2')",
+                Integer.class);
+        assertEquals(2, applied, "H2 should apply V1 and V2 common migrations");
+    }
+
+    @Test
     void unretryableTaskFailureSetsWorkflowFailed() throws Exception {
         String type = "it-failure-" + UUID.randomUUID();
         String workflowId = "it-wf-failure-" + UUID.randomUUID();

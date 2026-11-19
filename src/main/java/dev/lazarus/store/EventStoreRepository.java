@@ -10,9 +10,7 @@ import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
 import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
-import java.util.LinkedHashMap;
 import java.util.List;
-import java.util.Map;
 import java.util.Optional;
 
 public class EventStoreRepository {
@@ -136,9 +134,8 @@ public class EventStoreRepository {
         }
     }
 
-    /** Loads all durable step events in event order; legacy rows are upgraded by first-seen step key. */
+    /** Loads all durable step events in event order. Legacy ordinals are backfilled by versioned SQL migrations. */
     public List<WorkflowEvent> loadStepEvents(String workflowId) throws SQLException {
-        backfillLegacyStepOrdinals(workflowId);
         String sql = isH2 ? """
             SELECT event_id, workflow_id, sequence_num, step_key, event_type, payload, created_at,
                    step_ordinal, idempotency_key, workflow_version
@@ -170,46 +167,6 @@ public class EventStoreRepository {
         return List.copyOf(events);
     }
 
-    private void backfillLegacyStepOrdinals(String workflowId) throws SQLException {
-        String select = "SELECT event_id, step_key FROM workflow_events WHERE workflow_id = ? " +
-                "AND event_type IN ('STEP_STARTED', 'STEP_COMPLETED', 'STEP_FAILED') AND step_ordinal IS NULL ORDER BY sequence_num";
-        try (Connection conn = dataSource.getConnection()) {
-            conn.setAutoCommit(false);
-            try {
-                Map<String, Long> ordinals = new LinkedHashMap<>();
-                List<long[]> rows = new ArrayList<>();
-                List<String> keys = new ArrayList<>();
-                try (PreparedStatement ps = conn.prepareStatement(select)) {
-                    ps.setString(1, workflowId);
-                    try (ResultSet rs = ps.executeQuery()) {
-                        while (rs.next()) {
-                            String key = rs.getString("step_key");
-                            long ordinal = ordinals.computeIfAbsent(key, ignored -> (long) ordinals.size());
-                            rows.add(new long[]{rs.getLong("event_id"), ordinal});
-                            keys.add(key);
-                        }
-                    }
-                }
-                String update = "UPDATE workflow_events SET step_ordinal = ?, idempotency_key = ? " +
-                        "WHERE event_id = ? AND step_ordinal IS NULL";
-                try (PreparedStatement ps = conn.prepareStatement(update)) {
-                    for (int i = 0; i < rows.size(); i++) {
-                        long[] row = rows.get(i);
-                        ps.setLong(1, row[1]);
-                        ps.setString(2, StepContext.idempotencyKey(workflowId, row[1], keys.get(i)));
-                        ps.setLong(3, row[0]);
-                        ps.addBatch();
-                    }
-                    ps.executeBatch();
-                }
-                conn.commit();
-            } catch (SQLException | RuntimeException ex) {
-                conn.rollback();
-                throw ex;
-            }
-        }
-    }
-
     /** Appends a legacy/non-step event. Prefer appendStepEvent for step history. */
     public long appendEvent(String workflowId, String stepKey, String eventType, String payloadJson) throws SQLException {
         return appendEvent(workflowId, stepKey, eventType, payloadJson, null, null);
@@ -222,6 +179,9 @@ public class EventStoreRepository {
 
     private long appendEvent(String workflowId, String stepKey, String eventType, String payloadJson,
                              Long stepOrdinal, String idempotencyKey) throws SQLException {
+        if (isStepEvent(eventType) && (stepOrdinal == null || idempotencyKey == null || idempotencyKey.isBlank())) {
+            throw new IllegalArgumentException("Step events require a step ordinal and idempotency key; use appendStepEvent");
+        }
         try (Connection conn = dataSource.getConnection()) {
             conn.setAutoCommit(false);
             try {
@@ -267,6 +227,10 @@ public class EventStoreRepository {
                 throw ex;
             }
         }
+    }
+
+    private static boolean isStepEvent(String eventType) {
+        return "STEP_STARTED".equals(eventType) || "STEP_COMPLETED".equals(eventType) || "STEP_FAILED".equals(eventType);
     }
 
     /** Records local workflow terminal state and its event atomically. */

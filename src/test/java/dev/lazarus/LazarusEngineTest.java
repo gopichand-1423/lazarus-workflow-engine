@@ -2,6 +2,7 @@ package dev.lazarus;
 
 import com.zaxxer.hikari.HikariConfig;
 import com.zaxxer.hikari.HikariDataSource;
+import dev.lazarus.config.LazarusDatabaseMigrations;
 import dev.lazarus.dst.DeterministicChaosClock;
 import dev.lazarus.engine.LazarusEngine;
 import dev.lazarus.engine.NonDeterministicWorkflowException;
@@ -12,8 +13,6 @@ import dev.lazarus.store.TaskQueueRepository.ReapSummary;
 import dev.lazarus.workflow.StepContext;
 import org.junit.jupiter.api.*;
 
-import java.nio.file.Files;
-import java.nio.file.Path;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
@@ -50,12 +49,12 @@ class LazarusEngineTest {
 
         dataSource = new HikariDataSource(config);
 
-        String schemaSql = Files.readString(Path.of("src/main/resources/schema.sql"))
-                .replace("CREATE TABLE ", "CREATE TABLE IF NOT EXISTS ")
-                .replace("CREATE INDEX ", "CREATE INDEX IF NOT EXISTS ");
-        try (Connection conn = dataSource.getConnection(); Statement stmt = conn.createStatement()) {
-            stmt.execute(schemaSql);
+        String product;
+        try (Connection conn = dataSource.getConnection()) {
+            product = conn.getMetaData().getDatabaseProductName();
         }
+        LazarusDatabaseMigrations.migrate(dataSource,
+                "H2".equalsIgnoreCase(product) ? "h2" : "postgresql");
 
         eventStore = new EventStoreRepository(dataSource);
         taskQueue = new TaskQueueRepository(dataSource);
@@ -148,6 +147,7 @@ class LazarusEngineTest {
     @DisplayName("3. High-Concurrency Java 24 Virtual Thread Benchmark (200 Concurrent Workflows)")
     void benchmarkVirtualThreadThroughput() throws Exception {
         int workflowCount = 200;
+        AtomicInteger activityExecutions = new AtomicInteger();
         List<String> wfIds = new ArrayList<>(workflowCount);
         for (int i = 0; i < workflowCount; i++) {
             String id = "bench-wf-" + i + "-" + UUID.randomUUID().toString().substring(0, 6);
@@ -159,8 +159,14 @@ class LazarusEngineTest {
         List<Future<String>> futures = new ArrayList<>(workflowCount);
         for (String wfId : wfIds) {
             futures.add(engine.submitWorkflow(wfId, "{}", (ctx, in) -> {
-                String a = ctx.step("s1", String.class, () -> "A");
-                String b = ctx.step("s2", String.class, () -> "B");
+                String a = ctx.step("s1", String.class, () -> {
+                    activityExecutions.incrementAndGet();
+                    return "A";
+                });
+                String b = ctx.step("s2", String.class, () -> {
+                    activityExecutions.incrementAndGet();
+                    return "B";
+                });
                 return a + b;
             }));
         }
@@ -174,8 +180,14 @@ class LazarusEngineTest {
         List<Future<String>> replayFutures = new ArrayList<>(workflowCount);
         for (String wfId : wfIds) {
             replayFutures.add(engine.submitWorkflow(wfId, "{}", (ctx, in) -> {
-                String a = ctx.step("s1", String.class, () -> "A");
-                String b = ctx.step("s2", String.class, () -> "B");
+                String a = ctx.step("s1", String.class, () -> {
+                    activityExecutions.incrementAndGet();
+                    return "A";
+                });
+                String b = ctx.step("s2", String.class, () -> {
+                    activityExecutions.incrementAndGet();
+                    return "B";
+                });
                 return a + b;
             }));
         }
@@ -186,7 +198,8 @@ class LazarusEngineTest {
 
         System.out.printf("[BENCHMARK] 200 Concurrent Workflows (400 Durable Steps) | Live Exec: %.2f ms | Full Replay: %.2f ms%n",
                 execMs, replayMs);
-        assertTrue(replayMs < execMs, "Cached deterministic replay should be faster than live step persistence");
+        assertEquals(workflowCount * 2, activityExecutions.get(),
+                "Each activity runs once; deterministic replay must return durable results without re-execution");
     }
 
     @Test
