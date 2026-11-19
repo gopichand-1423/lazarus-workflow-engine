@@ -3,79 +3,178 @@ package dev.lazarus.dst;
 import com.zaxxer.hikari.HikariConfig;
 import com.zaxxer.hikari.HikariDataSource;
 import dev.lazarus.engine.LazarusEngine;
+import dev.lazarus.engine.WorkflowDefinitionRegistry;
+import dev.lazarus.engine.ZombieWorkerReaper;
 import dev.lazarus.store.EventStoreRepository;
 import dev.lazarus.store.TaskQueueRepository;
 import dev.lazarus.store.TaskQueueRepository.ClaimedTask;
 import dev.lazarus.store.TaskQueueRepository.ReapSummary;
+import dev.lazarus.workflow.InMemoryInventoryService;
+import dev.lazarus.workflow.InMemoryPaymentGateway;
+import dev.lazarus.workflow.InMemoryShippingService;
+import dev.lazarus.workflow.PaymentSagaWorkflow;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.sql.Connection;
 import java.sql.Statement;
+import java.time.Duration;
+import java.util.ArrayList;
 import java.util.List;
-import java.util.UUID;
+import java.util.Map;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
-public class LazarusSimulationRunner {
-
-    public static void main(String[] args) throws Exception {
-        long seed = args.length > 0 ? Long.parseLong(args[0]) : 42024L;
-        DeterministicChaosClock chaos = new DeterministicChaosClock(seed);
-
-        System.out.println("==========================================================");
-        System.out.println(" LAZARUS JAVA 24 - DETERMINISTIC SIMULATION HARNESS (DST)");
-        System.out.println(" Seed: " + chaos.seed() + " | Runtime: JDK " + Runtime.version());
-        System.out.println("==========================================================");
-
-        HikariConfig config = new HikariConfig();
-        String explicitUrl = System.getenv("LAZARUS_DB_URL");
-        String dbUrl;
-        String dbUser;
-        String dbPass;
-
-        if (explicitUrl != null && !explicitUrl.isBlank()) {
-            dbUrl = explicitUrl;
-            dbUser = System.getenv().getOrDefault("LAZARUS_DB_USER", "lazarus");
-            dbPass = System.getenv().getOrDefault("LAZARUS_DB_PASS", "lazarus_password");
-        } else if (isPortReachable("localhost", 5432, 1000)) {
-            dbUrl = "jdbc:postgresql://localhost:5432/lazarus_db";
-            dbUser = System.getenv().getOrDefault("LAZARUS_DB_USER", "lazarus");
-            dbPass = System.getenv().getOrDefault("LAZARUS_DB_PASS", "lazarus_password");
-        } else {
-            System.out.println("[NOTICE] PostgreSQL on port 5432 is unreachable. Activating automatic in-memory H2 PostgreSQL-compatible fallback.");
-            dbUrl = "jdbc:h2:mem:lazarus_db;MODE=PostgreSQL;DATABASE_TO_LOWER=TRUE;DEFAULT_NULL_ORDERING=HIGH;DB_CLOSE_DELAY=-1";
-            dbUser = "sa";
-            dbPass = "";
-        }
-
-        config.setJdbcUrl(dbUrl);
-        config.setUsername(dbUser);
-        config.setPassword(dbPass);
-        config.setMaximumPoolSize(10);
-
-        try (HikariDataSource ds = new HikariDataSource(config);
-             LazarusEngine engine = new LazarusEngine(new EventStoreRepository(ds))) {
-
-            ensureSchemaInitialized(ds);
-
-            EventStoreRepository eventStore = new EventStoreRepository(ds);
-            TaskQueueRepository taskQueue = new TaskQueueRepository(ds);
-
-            runSplitBrainFencingSimulation(eventStore, taskQueue);
-            runCrashAndReplaySimulation(eventStore, engine);
-
-            System.out.println("\n[DST PASS] All distributed durability and fencing invariants verified!");
+/** Repeatable, no-sleep durability and saga simulation. */
+public final class LazarusSimulationRunner {
+    public record SimulationTrace(long seed, List<String> outcomes) {
+        public SimulationTrace {
+            outcomes = List.copyOf(outcomes);
         }
     }
 
-    private static boolean isPortReachable(String host, int port, int timeoutMs) {
-        try (java.net.Socket socket = new java.net.Socket()) {
-            socket.connect(new java.net.InetSocketAddress(host, port), timeoutMs);
-            return true;
-        } catch (Exception e) {
-            return false;
+    private LazarusSimulationRunner() {}
+
+    public static void main(String[] args) throws Exception {
+        long seed = args.length > 0 ? Long.parseLong(args[0]) : 42024L;
+        HikariConfig config = new HikariConfig();
+        String explicitUrl = System.getenv("LAZARUS_DB_URL");
+        boolean useDefaultH2 = explicitUrl == null || explicitUrl.isBlank();
+        config.setJdbcUrl(useDefaultH2
+                ? "jdbc:h2:mem:lazarus_dst_" + seed + ";MODE=PostgreSQL;DATABASE_TO_LOWER=TRUE;DEFAULT_NULL_ORDERING=HIGH;DB_CLOSE_DELAY=-1"
+                : explicitUrl);
+        config.setUsername(System.getenv().getOrDefault("LAZARUS_DB_USER", useDefaultH2 ? "sa" : "lazarus"));
+        config.setPassword(System.getenv().getOrDefault("LAZARUS_DB_PASS", useDefaultH2 ? "" : "lazarus_password"));
+        config.setMaximumPoolSize(10);
+
+        try (HikariDataSource ds = new HikariDataSource(config)) {
+            ensureSchemaInitialized(ds);
+            SimulationTrace trace = runDeterministicSimulation(seed, ds);
+            System.out.println("==========================================================");
+            System.out.println(" LAZARUS JAVA 24 - DETERMINISTIC SIMULATION HARNESS (DST)");
+            System.out.println(" Seed: " + trace.seed() + " | Runtime: JDK " + Runtime.version());
+            trace.outcomes().forEach(System.out::println);
+            System.out.println("[DST PASS] Trace completed without wall-clock sleeps.");
+            System.out.println("==========================================================");
         }
+    }
+
+    public static SimulationTrace runDeterministicSimulation(long seed, HikariDataSource dataSource) throws Exception {
+        DeterministicChaosClock chaos = new DeterministicChaosClock(seed);
+        EventStoreRepository eventStore = new EventStoreRepository(dataSource, chaos);
+        TaskQueueRepository taskQueue = new TaskQueueRepository(dataSource, chaos);
+        List<String> outcomes = new ArrayList<>();
+
+        try (LazarusEngine engine = new LazarusEngine(eventStore)) {
+            simulateLeaseExpiryAndFencing(seed, chaos, eventStore, taskQueue, outcomes);
+            simulateCrashReplay(seed, chaos, eventStore, engine, outcomes);
+            simulatePaymentSaga(seed, chaos, eventStore, engine, outcomes);
+        }
+        return new SimulationTrace(seed, outcomes);
+    }
+
+    private static void simulateLeaseExpiryAndFencing(long seed, DeterministicChaosClock clock,
+                                                       EventStoreRepository eventStore,
+                                                       TaskQueueRepository taskQueue,
+                                                       List<String> outcomes) throws Exception {
+        String workflowId = "dst-lease-" + seed;
+        eventStore.createWorkflowInstance(workflowId, "dst-lease", "{}");
+        taskQueue.enqueueTask(workflowId, "lease-probe", 0, 5);
+        ClaimedTask zombie = taskQueue.pollNextTask("worker-zombie", 1).orElseThrow();
+        boolean workerCrash = clock.shouldInjectFault("worker-crash", 1.0);
+        if (!workerCrash) throw new AssertionError("The lease scenario expects a seeded worker crash");
+
+        clock.advance(Duration.ofSeconds(2));
+        ZombieWorkerReaper reaper = new ZombieWorkerReaper(taskQueue, Duration.ofSeconds(5), 10, clock);
+        ReapSummary summary = reaper.sweepOnce();
+        clock.advance(Duration.ofSeconds(2)); // Move through the persisted retry backoff instantly.
+        ClaimedTask healthy = taskQueue.pollNextTask("worker-healthy", 10).orElseThrow();
+        boolean healthyCommitted = taskQueue.completeTask(healthy.taskId(), workflowId, healthy.stepKey(),
+                "worker-healthy", healthy.fencingToken(), healthy.stepOrdinal(), healthy.idempotencyKey(),
+                true, false, "{\"lease\":\"recovered\"}", List.of("lease-probe"));
+        boolean zombieCommitted = taskQueue.completeTask(zombie.taskId(), workflowId, zombie.stepKey(),
+                "worker-zombie", zombie.fencingToken(), zombie.stepOrdinal(), zombie.idempotencyKey(),
+                true, false, "{\"lease\":\"stale\"}", List.of("lease-probe"));
+        outcomes.add("lease:reaped=" + summary.rescheduledCount() + ", healthyCommitted=" + healthyCommitted
+                + ", zombieCommitted=" + zombieCommitted + ", fence=" + healthy.fencingToken());
+        if (summary.rescheduledCount() != 1 || !healthyCommitted || zombieCommitted) {
+            throw new AssertionError("Virtual-time lease fencing invariant failed");
+        }
+    }
+
+    private static void simulateCrashReplay(long seed, DeterministicChaosClock clock,
+                                            EventStoreRepository eventStore, LazarusEngine engine,
+                                            List<String> outcomes) throws Exception {
+        String workflowId = "dst-replay-" + seed;
+        eventStore.createWorkflowInstance(workflowId, "dst-replay", "{}");
+        boolean injectCrash = clock.shouldInjectFault("crash-after-external-effect", 0.5);
+        AtomicBoolean crashOnce = new AtomicBoolean(injectCrash);
+        AtomicInteger sideEffectCount = new AtomicInteger();
+        Map<String, String> idempotentExternalService = new java.util.concurrent.ConcurrentHashMap<>();
+
+        LazarusEngine.DurableWorkflow<String, String> workflow = (ctx, input) -> {
+            String receipt = ctx.step("replay-charge", String.class, step -> {
+                String result = idempotentExternalService.computeIfAbsent(step.idempotencyKey(), key -> {
+                    sideEffectCount.incrementAndGet();
+                    return "receipt-" + seed;
+                });
+                if (crashOnce.getAndSet(false)) throw new AssertionError("seeded crash after external effect");
+                return result;
+            });
+            return receipt;
+        };
+
+        try {
+            engine.submitWorkflow(workflowId, "{}", workflow).get();
+        } catch (ExecutionException ex) {
+            if (!(ex.getCause() instanceof AssertionError)) throw ex;
+        }
+        String output = engine.submitWorkflow(workflowId, "{}", workflow).get();
+        outcomes.add("replay: injectedCrash=" + injectCrash + ", effectCount=" + sideEffectCount.get()
+                + ", output=" + output);
+        if (sideEffectCount.get() != 1) throw new AssertionError("Replay duplicated the external effect");
+    }
+
+    private static void simulatePaymentSaga(long seed, DeterministicChaosClock clock,
+                                            EventStoreRepository eventStore, LazarusEngine engine,
+                                            List<String> outcomes) throws Exception {
+        WorkflowDefinitionRegistry registry = new WorkflowDefinitionRegistry(List.of(PaymentSagaWorkflow.workflowDefinition()));
+        if (registry.find(PaymentSagaWorkflow.WORKFLOW_TYPE).isEmpty()) {
+            throw new AssertionError("Payment saga is not registered");
+        }
+        String workflowId = "dst-saga-" + seed;
+        eventStore.createWorkflowInstance(workflowId, PaymentSagaWorkflow.WORKFLOW_TYPE, "{}");
+        InMemoryPaymentGateway payments = new InMemoryPaymentGateway();
+        InMemoryInventoryService inventory = new InMemoryInventoryService();
+        InMemoryShippingService shipping = new InMemoryShippingService();
+        boolean shipFailure = clock.shouldInjectFault("ship-order-failure", 0.5);
+        shipping.setFailShipping(shipFailure);
+        boolean injectCrashAfterRelease = clock.shouldInjectFault("crash-after-release", 0.5);
+        boolean crashAfterReleaseSelected = shipFailure && injectCrashAfterRelease;
+        AtomicBoolean crashAfterRelease = new AtomicBoolean(crashAfterReleaseSelected);
+        PaymentSagaWorkflow saga = new PaymentSagaWorkflow(payments, inventory, shipping, compensation -> {
+            if ("release-inventory".equals(compensation) && crashAfterRelease.getAndSet(false)) {
+                throw new AssertionError("seeded crash after inventory release");
+            }
+        });
+        PaymentSagaWorkflow.Order order = new PaymentSagaWorkflow.Order("order-" + seed, 2_500,
+                List.of(new PaymentSagaWorkflow.OrderItem("sku-1", 2)), "1 Example Street");
+
+        PaymentSagaWorkflow.SagaResult result;
+        try {
+            result = engine.submitWorkflow(workflowId, order, saga).get();
+        } catch (ExecutionException ex) {
+            if (!(ex.getCause() instanceof AssertionError)) throw ex;
+            result = engine.submitWorkflow(workflowId, order, saga).get();
+        }
+        EventStoreRepository.WorkflowInstance instance = eventStore.loadWorkflowInstance(workflowId).orElseThrow();
+        outcomes.add("saga: shipFailure=" + shipFailure + ", crashAfterRelease=" + crashAfterReleaseSelected
+                + ", result=" + result.status() + ", persisted=" + instance.status()
+                + ", balance=" + payments.balanceCents(order.orderId())
+                + ", reservedUnits=" + inventory.reservedUnits());
+        eventStore.loadStepEvents(workflowId).forEach(event -> outcomes.add("saga-event:"
+                + event.stepOrdinal() + ":" + event.stepKey() + ":" + event.eventType() + ":" + event.payloadJson()));
     }
 
     private static void ensureSchemaInitialized(HikariDataSource ds) throws Exception {
@@ -85,85 +184,6 @@ public class LazarusSimulationRunner {
                 .replace("TIMESTAMPTZ", "TIMESTAMP WITH TIME ZONE");
         try (Connection conn = ds.getConnection(); Statement stmt = conn.createStatement()) {
             stmt.execute(schemaSql);
-        }
-    }
-
-    private static void runSplitBrainFencingSimulation(
-            EventStoreRepository eventStore,
-            TaskQueueRepository taskQueue
-    ) throws Exception {
-        System.out.println("\n--- [TEST 1] Split-Brain Lease Expiration & Zombie Fencing ---");
-        String wfId = "wf-fencing-" + UUID.randomUUID().toString().substring(0, 8);
-        eventStore.createWorkflowInstance(wfId, "payment-transfer", "{\"amount\":5000}");
-        taskQueue.enqueueTask(wfId, "debit-account", 5);
-
-        ClaimedTask claimA = taskQueue.pollNextTask("worker-A-zombie", 1).orElseThrow();
-        System.out.printf("1. Worker-A claimed taskId=%d (attempt=%d) with 1s lease, now stalling...%n",
-                claimA.taskId(), claimA.attempt());
-
-        Thread.sleep(1500);
-
-        ReapSummary reaped = taskQueue.reapZombieTasks(10);
-        System.out.printf("2. ZombieWorkerReaper swept expired tasks -> rescheduled=%d%n", reaped.rescheduledCount());
-
-        Thread.sleep(2200);
-
-        ClaimedTask claimB = taskQueue.pollNextTask("worker-B-healthy", 10).orElseThrow();
-        boolean committedB = taskQueue.completeTask(
-                claimB.taskId(), wfId, "debit-account", "worker-B-healthy", claimB.fencingToken(),
-                true, false, "{\"txId\":\"TX-900\"}", List.of("debit-account"));
-        System.out.printf("3. Worker-B claimed taskId=%d (attempt=%d) and committed -> success=%b%n",
-                claimB.taskId(), claimB.attempt(), committedB);
-
-        boolean committedA = taskQueue.completeTask(
-                claimA.taskId(), wfId, "debit-account", "worker-A-zombie", claimA.fencingToken(),
-                true, false, "{\"txId\":\"DUPLICATE-TX\"}", List.of("debit-account"));
-        System.out.printf("4. Zombie Worker-A attempted stale commit -> committed=%b (MUST BE FALSE)%n", committedA);
-
-        if (committedA || !committedB) {
-            throw new AssertionError("Split-brain fencing invariant violated!");
-        }
-    }
-
-    private static void runCrashAndReplaySimulation(
-            EventStoreRepository eventStore,
-            LazarusEngine engine
-    ) throws Exception {
-        System.out.println("\n--- [TEST 2] Crash Recovery & Deterministic Event Replay ---");
-        String wfId = "wf-replay-" + UUID.randomUUID().toString().substring(0, 8);
-        eventStore.createWorkflowInstance(wfId, "order-fulfillment", "{\"item\":\"GPU-Node\"}");
-
-        AtomicInteger paymentGatewayCalls = new AtomicInteger(0);
-        AtomicBoolean simulateCrashOnStep3 = new AtomicBoolean(true);
-
-        LazarusEngine.DurableWorkflow<String, String> workflow = (ctx, input) -> {
-            String reservation = ctx.step("1-reserve-stock", String.class, () -> "RES-101");
-            String chargeId = ctx.step("2-charge-card", String.class, () -> {
-                paymentGatewayCalls.incrementAndGet();
-                return "PAY-777";
-            });
-            String tracking = ctx.step("3-ship-order", String.class, () -> {
-                if (simulateCrashOnStep3.get()) {
-                    throw new RuntimeException("SIMULATED_JVM_CRASH_AT_STEP_3");
-                }
-                return "SHIP-OK-" + reservation + "-" + chargeId;
-            });
-            return tracking;
-        };
-
-        try {
-            engine.submitWorkflow(wfId, "{}", workflow).get();
-        } catch (Exception ex) {
-            System.out.println("1. First run crashed as expected: " + ex.getCause().getMessage());
-        }
-
-        simulateCrashOnStep3.set(false);
-        String finalResult = engine.submitWorkflow(wfId, "{}", workflow).get();
-        System.out.println("2. Recovered workflow output: " + finalResult);
-        System.out.println("3. Total payment gateway executions across both runs: " + paymentGatewayCalls.get() + " (MUST BE 1)");
-
-        if (paymentGatewayCalls.get() != 1) {
-            throw new AssertionError("Idempotency violated! Payment gateway called more than once.");
         }
     }
 }

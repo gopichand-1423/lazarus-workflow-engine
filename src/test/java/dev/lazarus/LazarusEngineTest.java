@@ -2,6 +2,7 @@ package dev.lazarus;
 
 import com.zaxxer.hikari.HikariConfig;
 import com.zaxxer.hikari.HikariDataSource;
+import dev.lazarus.dst.DeterministicChaosClock;
 import dev.lazarus.engine.LazarusEngine;
 import dev.lazarus.engine.NonDeterministicWorkflowException;
 import dev.lazarus.store.EventStoreRepository;
@@ -17,7 +18,7 @@ import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.Statement;
-import java.sql.Timestamp;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.*;
 import java.util.concurrent.Callable;
@@ -59,6 +60,13 @@ class LazarusEngineTest {
         eventStore = new EventStoreRepository(dataSource);
         taskQueue = new TaskQueueRepository(dataSource);
         engine = new LazarusEngine(eventStore);
+    }
+
+    @BeforeEach
+    void clearTaskQueueBetweenTests() throws Exception {
+        try (Connection conn = dataSource.getConnection(); Statement statement = conn.createStatement()) {
+            statement.executeUpdate("DELETE FROM workflow_tasks");
+        }
     }
 
     @AfterAll
@@ -184,46 +192,52 @@ class LazarusEngineTest {
     @Test
     @DisplayName("5. Expired lease cannot complete before the zombie reaper runs")
     void testExpiredLeaseCannotCompleteBeforeReaper() throws Exception {
+        DeterministicChaosClock clock = new DeterministicChaosClock(105);
+        EventStoreRepository clockedEventStore = new EventStoreRepository(dataSource, clock);
+        TaskQueueRepository clockedTaskQueue = new TaskQueueRepository(dataSource, clock);
         String wfId = "test-expired-lease-" + UUID.randomUUID();
-        eventStore.createWorkflowInstance(wfId, "lease-fencing", "{}");
-        taskQueue.enqueueTask(wfId, "step-expired", 5);
-        ClaimedTask claim = taskQueue.pollNextTask("worker-expired", 30).orElseThrow();
+        clockedEventStore.createWorkflowInstance(wfId, "lease-fencing", "{}");
+        clockedTaskQueue.enqueueTask(wfId, "step-expired", 5);
+        ClaimedTask claim = clockedTaskQueue.pollNextTask("worker-expired", 30).orElseThrow();
 
-        markLeaseExpired(claim.taskId());
+        clock.advance(Duration.ofSeconds(31));
 
-        assertFalse(taskQueue.completeTask(
+        assertFalse(clockedTaskQueue.completeTask(
                 claim.taskId(), wfId, "step-expired", "worker-expired", claim.fencingToken(),
-                true, false, "{}", List.of("step-expired")));
+                claim.stepOrdinal(), claim.idempotencyKey(), true, false, "{}", List.of("step-expired")));
         assertEquals(0, countEvents(wfId, "step-expired", "STEP_COMPLETED"));
-        taskQueue.reapZombieTasks(10);
+        clockedTaskQueue.reapZombieTasks(10);
     }
 
     @Test
     @DisplayName("6. A previous claim token is fenced after the same worker reclaims the task")
     void testOlderFencingTokenRejectedAfterSameWorkerReclaims() throws Exception {
+        DeterministicChaosClock clock = new DeterministicChaosClock(106);
+        EventStoreRepository clockedEventStore = new EventStoreRepository(dataSource, clock);
+        TaskQueueRepository clockedTaskQueue = new TaskQueueRepository(dataSource, clock);
         String wfId = "test-reclaimed-lease-" + UUID.randomUUID();
-        eventStore.createWorkflowInstance(wfId, "lease-fencing", "{}");
-        taskQueue.enqueueTask(wfId, "step-reclaimed", 5);
+        clockedEventStore.createWorkflowInstance(wfId, "lease-fencing", "{}");
+        clockedTaskQueue.enqueueTask(wfId, "step-reclaimed", 5);
         String workerId = "worker-reclaimed";
-        ClaimedTask firstClaim = taskQueue.pollNextTask(workerId, 30).orElseThrow();
+        ClaimedTask firstClaim = clockedTaskQueue.pollNextTask(workerId, 30).orElseThrow();
 
-        markLeaseExpired(firstClaim.taskId());
-        ReapSummary reaped = taskQueue.reapZombieTasks(10);
+        clock.advance(Duration.ofSeconds(31));
+        ReapSummary reaped = clockedTaskQueue.reapZombieTasks(10);
         assertTrue(reaped.rescheduledCount() >= 1);
-        makeTaskImmediatelyAvailable(firstClaim.taskId());
+        clock.advance(Duration.ofSeconds(2));
 
-        ClaimedTask secondClaim = taskQueue.pollNextTask(workerId, 30).orElseThrow();
+        ClaimedTask secondClaim = clockedTaskQueue.pollNextTask(workerId, 30).orElseThrow();
         assertTrue(secondClaim.fencingToken() > firstClaim.fencingToken());
-        assertFalse(taskQueue.extendLease(
+        assertFalse(clockedTaskQueue.extendLease(
                 secondClaim.taskId(), workerId, firstClaim.fencingToken(), 30));
-        assertTrue(taskQueue.extendLease(
+        assertTrue(clockedTaskQueue.extendLease(
                 secondClaim.taskId(), workerId, secondClaim.fencingToken(), 30));
 
-        assertFalse(taskQueue.completeTask(
+        assertFalse(clockedTaskQueue.completeTask(
                 firstClaim.taskId(), wfId, "step-reclaimed", workerId, firstClaim.fencingToken(),
                 true, false, "{\"old\":true}", List.of("step-reclaimed")));
         assertEquals(0, countEvents(wfId, "step-reclaimed", "STEP_COMPLETED"));
-        assertTrue(taskQueue.completeTask(
+        assertTrue(clockedTaskQueue.completeTask(
                 secondClaim.taskId(), wfId, "step-reclaimed", workerId, secondClaim.fencingToken(),
                 true, false, "{\"new\":true}", List.of("step-reclaimed")));
         assertEquals(1, countEvents(wfId, "step-reclaimed", "STEP_COMPLETED"));
@@ -368,23 +382,6 @@ class LazarusEngineTest {
         assertEquals(1, countEvents(failureId, "__workflow__", "WORKFLOW_FAILED"));
     }
 
-    private static void markLeaseExpired(long taskId) throws Exception {
-        String sql = "UPDATE workflow_tasks SET lease_expires_at = ? WHERE task_id = ?";
-        try (Connection conn = dataSource.getConnection(); PreparedStatement ps = conn.prepareStatement(sql)) {
-            ps.setTimestamp(1, Timestamp.from(Instant.now().minusSeconds(10)));
-            ps.setLong(2, taskId);
-            assertEquals(1, ps.executeUpdate());
-        }
-    }
-
-    private static void makeTaskImmediatelyAvailable(long taskId) throws Exception {
-        String sql = "UPDATE workflow_tasks SET next_run_at = NOW() WHERE task_id = ? AND status = 'PENDING'";
-        try (Connection conn = dataSource.getConnection(); PreparedStatement ps = conn.prepareStatement(sql)) {
-            ps.setLong(1, taskId);
-            assertEquals(1, ps.executeUpdate());
-        }
-    }
-
     private static long countEvents(String workflowId, String stepKey, String eventType) throws Exception {
         String sql = "SELECT COUNT(*) FROM workflow_events WHERE workflow_id = ? AND step_key = ? AND event_type = ?";
         try (Connection conn = dataSource.getConnection(); PreparedStatement ps = conn.prepareStatement(sql)) {
@@ -401,14 +398,17 @@ class LazarusEngineTest {
     @Test
     @DisplayName("4. Dead-Letter Queue (DLQ) Replay: Resets exhausted tasks to PENDING with attempt=0")
     void testDeadLetterQueueReplay() throws Exception {
+        DeterministicChaosClock clock = new DeterministicChaosClock(104);
+        EventStoreRepository clockedEventStore = new EventStoreRepository(dataSource, clock);
+        TaskQueueRepository clockedTaskQueue = new TaskQueueRepository(dataSource, clock);
         String wfId = "test-dlq-" + UUID.randomUUID();
-        eventStore.createWorkflowInstance(wfId, "dlq-recovery", "{}");
-        taskQueue.seedDeadLetterTask(wfId, "step-poison-pill");
+        clockedEventStore.createWorkflowInstance(wfId, "dlq-recovery", "{}");
+        clockedTaskQueue.seedDeadLetterTask(wfId, "step-poison-pill");
 
-        int replayed = taskQueue.replayDeadLetterTasks();
+        int replayed = clockedTaskQueue.replayDeadLetterTasks();
         assertTrue(replayed >= 1, "Should replay at least 1 dead-lettered task");
 
-        Optional<ClaimedTask> claimed = taskQueue.pollNextTask("worker-dlq-recovery", 15);
+        Optional<ClaimedTask> claimed = clockedTaskQueue.pollNextTask("worker-dlq-recovery", 15);
         assertTrue(claimed.isPresent(), "Replayed DLQ task must be immediately claimable by a worker");
         assertEquals(1, claimed.get().attempt(), "Attempt counter must reset to 1 upon new claim");
     }

@@ -29,7 +29,7 @@ public class LazarusEngine implements AutoCloseable {
             try {
                 WorkflowContext ctx = new WorkflowContext(workflowId, eventStore, mapper);
                 O result = workflow.execute(ctx, input);
-                eventStore.recordWorkflowTerminal(workflowId, "COMPLETED", mapper.writeValueAsString(result));
+                eventStore.recordWorkflowTerminal(workflowId, ctx.successfulTerminalStatus(), mapper.writeValueAsString(result));
                 return result;
             } catch (Throwable failure) {
                 String reason = failure.getMessage() == null ? failure.getClass().getSimpleName() : failure.getMessage();

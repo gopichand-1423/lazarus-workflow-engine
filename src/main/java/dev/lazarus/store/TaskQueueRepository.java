@@ -3,6 +3,11 @@ package dev.lazarus.store;
 import javax.sql.DataSource;
 import dev.lazarus.workflow.StepContext;
 import java.sql.*;
+import java.time.Clock;
+import java.time.Instant;
+import java.time.OffsetDateTime;
+import java.time.ZoneOffset;
+import java.time.temporal.ChronoUnit;
 import java.util.List;
 import java.util.Optional;
 
@@ -27,10 +32,26 @@ public class TaskQueueRepository {
 
     private final DataSource dataSource;
     private final boolean isH2;
+    private final Clock clock;
 
     public TaskQueueRepository(DataSource dataSource) {
+        this(dataSource, Clock.systemUTC());
+    }
+
+    public TaskQueueRepository(DataSource dataSource, Clock clock) {
         this.dataSource = dataSource;
+        this.clock = clock;
         this.isH2 = checkIsH2(dataSource);
+    }
+
+    private static void setInstant(PreparedStatement ps, int index, Instant instant) throws SQLException {
+        // PostgreSQL and H2 persist timestamp-with-time-zone at microsecond precision by default.
+        // Truncating keeps a just-enqueued due time from rounding into the future.
+        ps.setObject(index, OffsetDateTime.ofInstant(instant.truncatedTo(ChronoUnit.MICROS), ZoneOffset.UTC));
+    }
+
+    private static Instant retryAt(Instant now, int attempt) {
+        return now.plusSeconds(1L << Math.min(Math.max(attempt, 0), 30));
     }
 
     private static boolean checkIsH2(DataSource ds) {
@@ -50,10 +71,11 @@ public class TaskQueueRepository {
 
     public void enqueueTask(String workflowId, String stepKey, long stepOrdinal, int maxAttempts) throws SQLException {
         String idempotencyKey = StepContext.idempotencyKey(workflowId, stepOrdinal, stepKey);
+        Instant now = clock.instant();
         if (isH2) {
             String sql = """
                 INSERT INTO workflow_tasks (workflow_id, step_key, step_ordinal, idempotency_key, status, max_attempts, next_run_at)
-                SELECT ?, ?, ?, ?, 'PENDING', ?, NOW()
+                SELECT ?, ?, ?, ?, 'PENDING', ?, ?
                 WHERE NOT EXISTS (SELECT 1 FROM workflow_tasks WHERE workflow_id = ? AND step_ordinal = ?)
                 """;
             try (Connection conn = dataSource.getConnection();
@@ -63,8 +85,9 @@ public class TaskQueueRepository {
                 ps.setLong(3, stepOrdinal);
                 ps.setString(4, idempotencyKey);
                 ps.setInt(5, maxAttempts);
-                ps.setString(6, workflowId);
-                ps.setLong(7, stepOrdinal);
+                setInstant(ps, 6, now);
+                ps.setString(7, workflowId);
+                ps.setLong(8, stepOrdinal);
                 ps.executeUpdate();
             }
             return;
@@ -72,7 +95,7 @@ public class TaskQueueRepository {
 
         String sql = """
             INSERT INTO workflow_tasks (workflow_id, step_key, step_ordinal, idempotency_key, status, max_attempts, next_run_at)
-            VALUES (?, ?, ?, ?, 'PENDING', ?, NOW())
+            VALUES (?, ?, ?, ?, 'PENDING', ?, ?)
             ON CONFLICT (workflow_id, step_ordinal) DO NOTHING
             """;
         try (Connection conn = dataSource.getConnection();
@@ -82,6 +105,7 @@ public class TaskQueueRepository {
             ps.setLong(3, stepOrdinal);
             ps.setString(4, idempotencyKey);
             ps.setInt(5, maxAttempts);
+            setInstant(ps, 6, now);
             ps.executeUpdate();
         }
     }
@@ -91,6 +115,8 @@ public class TaskQueueRepository {
      * never block each other or double-claim the same step.
      */
     public Optional<ClaimedTask> pollNextTask(String workerId, int leaseDurationSeconds) throws SQLException {
+        Instant now = clock.instant();
+        Instant leaseExpiresAt = now.plusSeconds(leaseDurationSeconds);
         if (isH2) {
             String selectSql = """
                 SELECT wt.task_id, wt.workflow_id, wt.step_key, wt.attempt, wt.fencing_token,
@@ -98,7 +124,7 @@ public class TaskQueueRepository {
                 FROM workflow_tasks wt
                 JOIN workflow_instances wi ON wi.workflow_id = wt.workflow_id
                 WHERE wt.status = 'PENDING'
-                  AND wt.next_run_at <= NOW()
+                  AND wt.next_run_at <= ?
                 ORDER BY wt.next_run_at ASC
                 LIMIT 1
                 FOR UPDATE
@@ -110,10 +136,10 @@ public class TaskQueueRepository {
                     attempt = ?,
                     fencing_token = ?,
                     idempotency_key = COALESCE(idempotency_key, ?),
-                    lease_expires_at = DATEADD('SECOND', ?, NOW())
+                    lease_expires_at = ?
                 WHERE task_id = ?
                   AND status = 'PENDING'
-                  AND next_run_at <= NOW()
+                  AND next_run_at <= ?
                 """;
             try (Connection conn = dataSource.getConnection()) {
                 conn.setAutoCommit(false);
@@ -126,8 +152,9 @@ public class TaskQueueRepository {
                     long stepOrdinal;
                     String idempotencyKey;
                     String inputJson;
-                    try (PreparedStatement ps = conn.prepareStatement(selectSql);
-                         ResultSet rs = ps.executeQuery()) {
+                    try (PreparedStatement ps = conn.prepareStatement(selectSql)) {
+                        setInstant(ps, 1, now);
+                        try (ResultSet rs = ps.executeQuery()) {
                         if (!rs.next()) {
                             conn.rollback();
                             return Optional.empty();
@@ -141,14 +168,16 @@ public class TaskQueueRepository {
                         idempotencyKey = rs.getString("idempotency_key");
                         if (idempotencyKey == null) idempotencyKey = StepContext.idempotencyKey(workflowId, stepOrdinal, stepKey);
                         inputJson = rs.getString("input_payload");
+                        }
                     }
                     try (PreparedStatement updPs = conn.prepareStatement(updateSql)) {
                         updPs.setString(1, workerId);
                         updPs.setInt(2, newAttempt);
                         updPs.setLong(3, newFencingToken);
                         updPs.setString(4, idempotencyKey);
-                        updPs.setInt(5, leaseDurationSeconds);
+                        setInstant(updPs, 5, leaseExpiresAt);
                         updPs.setLong(6, taskId);
+                        setInstant(updPs, 7, now);
                         if (updPs.executeUpdate() != 1) {
                             conn.rollback();
                             return Optional.empty();
@@ -170,7 +199,7 @@ public class TaskQueueRepository {
                 SELECT task_id
                 FROM workflow_tasks
                 WHERE status = 'PENDING'
-                  AND next_run_at <= NOW()
+                  AND next_run_at <= ?
                 ORDER BY next_run_at ASC
                 LIMIT 1
                 FOR UPDATE SKIP LOCKED
@@ -181,7 +210,7 @@ public class TaskQueueRepository {
                 attempt = wt.attempt + 1,
                 fencing_token = wt.fencing_token + 1,
                 idempotency_key = COALESCE(wt.idempotency_key, wt.workflow_id || ':' || wt.step_ordinal || ':' || wt.step_key),
-                lease_expires_at = NOW() + (? * INTERVAL '1 second')
+                lease_expires_at = ?
             FROM next_task nt, workflow_instances wi
             WHERE wt.task_id = nt.task_id
               AND wi.workflow_id = wt.workflow_id
@@ -194,8 +223,9 @@ public class TaskQueueRepository {
             try {
                 ClaimedTask task = null;
                 try (PreparedStatement ps = conn.prepareStatement(claimSql)) {
-                    ps.setString(1, workerId);
-                    ps.setInt(2, leaseDurationSeconds);
+                    setInstant(ps, 1, now);
+                    ps.setString(2, workerId);
+                    setInstant(ps, 3, leaseExpiresAt);
                     try (ResultSet rs = ps.executeQuery()) {
                         if (rs.next()) {
                             task = new ClaimedTask(
@@ -224,41 +254,45 @@ public class TaskQueueRepository {
      * Extends an active task lease. Returns false if the worker lost ownership (fenced off).
      */
     public boolean extendLease(long taskId, String workerId, long fencingToken, int extendSeconds) throws SQLException {
+        Instant now = clock.instant();
+        Instant leaseExpiresAt = now.plusSeconds(extendSeconds);
         if (isH2) {
             String sql = """
                 UPDATE workflow_tasks
-                SET lease_expires_at = DATEADD('SECOND', ?, NOW())
+                SET lease_expires_at = ?
                 WHERE task_id = ?
                   AND worker_id = ?
                   AND fencing_token = ?
                   AND status = 'IN_PROGRESS'
-                  AND lease_expires_at > NOW()
+                  AND lease_expires_at > ?
                 """;
             try (Connection conn = dataSource.getConnection();
                  PreparedStatement ps = conn.prepareStatement(sql)) {
-                ps.setInt(1, extendSeconds);
+                setInstant(ps, 1, leaseExpiresAt);
                 ps.setLong(2, taskId);
                 ps.setString(3, workerId);
                 ps.setLong(4, fencingToken);
+                setInstant(ps, 5, now);
                 return ps.executeUpdate() == 1;
             }
         }
 
         String sql = """
             UPDATE workflow_tasks
-            SET lease_expires_at = NOW() + (? * INTERVAL '1 second')
+            SET lease_expires_at = ?
             WHERE task_id = ?
               AND worker_id = ?
               AND fencing_token = ?
               AND status = 'IN_PROGRESS'
-              AND lease_expires_at > clock_timestamp()
+              AND lease_expires_at > ?
             """;
         try (Connection conn = dataSource.getConnection();
              PreparedStatement ps = conn.prepareStatement(sql)) {
-            ps.setInt(1, extendSeconds);
+            setInstant(ps, 1, leaseExpiresAt);
             ps.setLong(2, taskId);
             ps.setString(3, workerId);
             ps.setLong(4, fencingToken);
+            setInstant(ps, 5, now);
             return ps.executeUpdate() == 1;
         }
     }
@@ -302,6 +336,7 @@ public class TaskQueueRepository {
             return false;
         }
         String nextStepKey = stepIndex + 1 < workflowStepKeys.size() ? workflowStepKeys.get(stepIndex + 1) : null;
+        Instant now = clock.instant();
 
         String taskUpdateSql;
         if (isH2) {
@@ -316,13 +351,13 @@ public class TaskQueueRepository {
                   AND idempotency_key = ?
                   AND workflow_id = ?
                   AND step_key = ?
-                  AND lease_expires_at > NOW()
+                  AND lease_expires_at > ?
                 """ : """
                 UPDATE workflow_tasks
                 SET status = CASE WHEN attempt >= max_attempts OR ? = FALSE THEN 'DEAD_LETTER' ELSE 'PENDING' END,
                     worker_id = NULL,
                     lease_expires_at = NULL,
-                    next_run_at = DATEADD('SECOND', POWER(2, attempt), NOW())
+                    next_run_at = ?
                 WHERE task_id = ?
                   AND status = 'IN_PROGRESS'
                   AND worker_id = ?
@@ -331,7 +366,7 @@ public class TaskQueueRepository {
                   AND idempotency_key = ?
                   AND workflow_id = ?
                   AND step_key = ?
-                  AND lease_expires_at > NOW()
+                  AND lease_expires_at > ?
                 """;
         } else {
             taskUpdateSql = success ? """
@@ -345,13 +380,13 @@ public class TaskQueueRepository {
                   AND idempotency_key = ?
                   AND workflow_id = ?
                   AND step_key = ?
-                  AND lease_expires_at > clock_timestamp()
+                  AND lease_expires_at > ?
                 """ : """
                 UPDATE workflow_tasks
                 SET status = CASE WHEN attempt >= max_attempts OR ? = FALSE THEN 'DEAD_LETTER' ELSE 'PENDING' END,
                     worker_id = NULL,
                     lease_expires_at = NULL,
-                    next_run_at = NOW() + (POWER(2, attempt) * INTERVAL '1 second')
+                    next_run_at = ?
                 WHERE task_id = ?
                   AND status = 'IN_PROGRESS'
                   AND worker_id = ?
@@ -360,7 +395,7 @@ public class TaskQueueRepository {
                   AND idempotency_key = ?
                   AND workflow_id = ?
                   AND step_key = ?
-                  AND lease_expires_at > clock_timestamp()
+                  AND lease_expires_at > ?
                 """;
         }
 
@@ -373,6 +408,7 @@ public class TaskQueueRepository {
                     int parameter = 1;
                     if (!success) {
                         taskPs.setBoolean(parameter++, retryable);
+                        setInstant(taskPs, parameter++, retryAtForTask(conn, taskId, now));
                     }
                     taskPs.setLong(parameter++, taskId);
                     taskPs.setString(parameter++, workerId);
@@ -380,7 +416,8 @@ public class TaskQueueRepository {
                     taskPs.setLong(parameter++, stepOrdinal);
                     taskPs.setString(parameter++, idempotencyKey);
                     taskPs.setString(parameter++, workflowId);
-                    taskPs.setString(parameter, stepKey);
+                    taskPs.setString(parameter++, stepKey);
+                    setInstant(taskPs, parameter, now);
                     if (taskPs.executeUpdate() != 1) {
                         conn.rollback();
                         return false;
@@ -418,13 +455,14 @@ public class TaskQueueRepository {
     private void enqueueTaskInTransaction(Connection conn, String workflowId, String stepKey,
                                           long stepOrdinal, int maxAttempts) throws SQLException {
         String idempotencyKey = StepContext.idempotencyKey(workflowId, stepOrdinal, stepKey);
+        Instant now = clock.instant();
         String sql = isH2 ? """
             INSERT INTO workflow_tasks (workflow_id, step_key, step_ordinal, idempotency_key, status, max_attempts, next_run_at)
-            SELECT ?, ?, ?, ?, 'PENDING', ?, NOW()
+            SELECT ?, ?, ?, ?, 'PENDING', ?, ?
             WHERE NOT EXISTS (SELECT 1 FROM workflow_tasks WHERE workflow_id = ? AND step_ordinal = ?)
             """ : """
             INSERT INTO workflow_tasks (workflow_id, step_key, step_ordinal, idempotency_key, status, max_attempts, next_run_at)
-            VALUES (?, ?, ?, ?, 'PENDING', ?, NOW())
+            VALUES (?, ?, ?, ?, 'PENDING', ?, ?)
             ON CONFLICT (workflow_id, step_ordinal) DO NOTHING
             """;
         try (PreparedStatement ps = conn.prepareStatement(sql)) {
@@ -433,9 +471,10 @@ public class TaskQueueRepository {
             ps.setLong(3, stepOrdinal);
             ps.setString(4, idempotencyKey);
             ps.setInt(5, maxAttempts);
+            setInstant(ps, 6, now);
             if (isH2) {
-                ps.setString(6, workflowId);
-                ps.setLong(7, stepOrdinal);
+                ps.setString(7, workflowId);
+                ps.setLong(8, stepOrdinal);
             }
             ps.executeUpdate();
         }
@@ -462,6 +501,7 @@ public class TaskQueueRepository {
     ) throws SQLException {
         long sequence;
         int workflowVersion;
+        Instant now = clock.instant();
         if (isH2) {
             try (PreparedStatement ps = conn.prepareStatement(
                     "SELECT current_version, workflow_version FROM workflow_instances WHERE workflow_id = ? FOR UPDATE")) {
@@ -476,20 +516,22 @@ public class TaskQueueRepository {
             }
             try (PreparedStatement ps = conn.prepareStatement("""
                     UPDATE workflow_instances
-                    SET current_version = current_version + 1, updated_at = NOW()
+                    SET current_version = current_version + 1, updated_at = ?
                     WHERE workflow_id = ?
                     """)) {
-                ps.setString(1, workflowId);
+                setInstant(ps, 1, now);
+                ps.setString(2, workflowId);
                 ps.executeUpdate();
             }
         } else {
             try (PreparedStatement ps = conn.prepareStatement("""
                     UPDATE workflow_instances
-                    SET current_version = current_version + 1, updated_at = NOW()
+                    SET current_version = current_version + 1, updated_at = ?
                     WHERE workflow_id = ?
                     RETURNING current_version, workflow_version
                     """)) {
-                ps.setString(1, workflowId);
+                setInstant(ps, 1, now);
+                ps.setString(2, workflowId);
                 try (ResultSet rs = ps.executeQuery()) {
                     if (!rs.next()) {
                         throw new IllegalStateException("Workflow instance missing: " + workflowId);
@@ -502,12 +544,12 @@ public class TaskQueueRepository {
 
         String sql = isH2 ? """
             INSERT INTO workflow_events (workflow_id, sequence_num, step_key, event_type, payload,
-                                         step_ordinal, idempotency_key, workflow_version)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                                         step_ordinal, idempotency_key, workflow_version, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """ : """
             INSERT INTO workflow_events (workflow_id, sequence_num, step_key, event_type, payload,
-                                         step_ordinal, idempotency_key, workflow_version)
-            VALUES (?, ?, ?, ?, ?::jsonb, ?, ?, ?)
+                                         step_ordinal, idempotency_key, workflow_version, created_at)
+            VALUES (?, ?, ?, ?, ?::jsonb, ?, ?, ?, ?)
             """;
         try (PreparedStatement ps = conn.prepareStatement(sql)) {
             ps.setString(1, workflowId);
@@ -518,6 +560,7 @@ public class TaskQueueRepository {
             if (stepOrdinal == null) ps.setNull(6, Types.BIGINT); else ps.setLong(6, stepOrdinal);
             ps.setString(7, idempotencyKey);
             ps.setInt(8, workflowVersion);
+            setInstant(ps, 9, now);
             ps.executeUpdate();
         }
     }
@@ -536,25 +579,46 @@ public class TaskQueueRepository {
         }
     }
 
+    private Instant retryAtForTask(Connection conn, long taskId, Instant now) throws SQLException {
+        try (PreparedStatement ps = conn.prepareStatement("SELECT attempt FROM workflow_tasks WHERE task_id = ?")) {
+            ps.setLong(1, taskId);
+            try (ResultSet rs = ps.executeQuery()) {
+                if (!rs.next()) return now;
+                return retryAt(now, rs.getInt("attempt"));
+            }
+        }
+    }
+
     private boolean updateWorkflowTerminalInTransaction(
             Connection conn,
             String workflowId,
             String status,
             String payloadJson
     ) throws SQLException {
+        return updateWorkflowTerminalInTransaction(conn, workflowId, status, payloadJson, clock.instant());
+    }
+
+    private boolean updateWorkflowTerminalInTransaction(
+            Connection conn,
+            String workflowId,
+            String status,
+            String payloadJson,
+            Instant now
+    ) throws SQLException {
         String sql = isH2 ? """
             UPDATE workflow_instances
-            SET status = ?, output_payload = ? FORMAT JSON, updated_at = NOW()
+            SET status = ?, output_payload = ? FORMAT JSON, updated_at = ?
             WHERE workflow_id = ? AND status = 'RUNNING'
             """ : """
             UPDATE workflow_instances
-            SET status = ?, output_payload = ?::jsonb, updated_at = NOW()
+            SET status = ?, output_payload = ?::jsonb, updated_at = ?
             WHERE workflow_id = ? AND status = 'RUNNING'
             """;
         try (PreparedStatement ps = conn.prepareStatement(sql)) {
             ps.setString(1, status);
             ps.setString(2, payloadJson);
-            ps.setString(3, workflowId);
+            setInstant(ps, 3, now);
+            ps.setString(4, workflowId);
             return ps.executeUpdate() == 1;
         }
     }
@@ -574,12 +638,16 @@ public class TaskQueueRepository {
      * exhausted tasks are moved to DEAD_LETTER.
      */
     public ReapSummary reapZombieTasks(int batchSize) throws SQLException {
+        return reapZombieTasks(batchSize, clock.instant());
+    }
+
+    public ReapSummary reapZombieTasks(int batchSize, Instant now) throws SQLException {
         if (isH2) {
             String selectExpired = """
                 SELECT task_id, attempt, max_attempts, workflow_id, step_key, step_ordinal, idempotency_key
                 FROM workflow_tasks
                 WHERE status = 'IN_PROGRESS'
-                  AND lease_expires_at < NOW()
+                  AND lease_expires_at < ?
                 ORDER BY lease_expires_at ASC
                 LIMIT ?
                 FOR UPDATE
@@ -594,7 +662,7 @@ public class TaskQueueRepository {
                 SET status = 'PENDING',
                     worker_id = NULL,
                     lease_expires_at = NULL,
-                    next_run_at = DATEADD('SECOND', POWER(2, attempt), NOW())
+                    next_run_at = ?
                 WHERE task_id = ?
                 """;
             int rescheduled = 0;
@@ -604,7 +672,8 @@ public class TaskQueueRepository {
                 try {
                     List<ExpiredTask> expiredList = new java.util.ArrayList<>();
                     try (PreparedStatement ps = conn.prepareStatement(selectExpired)) {
-                        ps.setInt(1, batchSize);
+                        setInstant(ps, 1, now);
+                        ps.setInt(2, batchSize);
                         try (ResultSet rs = ps.executeQuery()) {
                             while (rs.next()) {
                                 expiredList.add(new ExpiredTask(
@@ -628,11 +697,12 @@ public class TaskQueueRepository {
                                 ps.executeUpdate();
                             }
                             markWorkflowFailedForExpiredTask(conn, item.workflowId(), item.stepKey(), item.stepOrdinal(),
-                                    item.idempotencyKey(), item.attempt());
+                                    item.idempotencyKey(), item.attempt(), now);
                             deadLettered++;
                         } else {
                             try (PreparedStatement ps = conn.prepareStatement(rescheduleTask)) {
-                                ps.setLong(1, item.taskId());
+                                setInstant(ps, 1, retryAt(now, item.attempt()));
+                                ps.setLong(2, item.taskId());
                                 ps.executeUpdate();
                             }
                             rescheduled++;
@@ -652,7 +722,7 @@ public class TaskQueueRepository {
                 SELECT task_id
                 FROM workflow_tasks
                 WHERE status = 'IN_PROGRESS'
-                  AND lease_expires_at < NOW()
+                  AND lease_expires_at < ?
                 ORDER BY lease_expires_at ASC
                 LIMIT ?
                 FOR UPDATE SKIP LOCKED
@@ -663,7 +733,7 @@ public class TaskQueueRepository {
                 lease_expires_at = NULL,
                 next_run_at = CASE
                     WHEN wt.attempt >= wt.max_attempts THEN wt.next_run_at
-                    ELSE NOW() + (POWER(2, wt.attempt) * INTERVAL '1 second')
+                    ELSE ? + (POWER(2, wt.attempt) * INTERVAL '1 second')
                 END
             FROM expired e
             WHERE wt.task_id = e.task_id
@@ -677,7 +747,9 @@ public class TaskQueueRepository {
             conn.setAutoCommit(false);
             try {
                 try (PreparedStatement ps = conn.prepareStatement(reapSql)) {
-                    ps.setInt(1, batchSize);
+                    setInstant(ps, 1, now);
+                    ps.setInt(2, batchSize);
+                    setInstant(ps, 3, now);
                     try (ResultSet rs = ps.executeQuery()) {
                         while (rs.next()) {
                             String newStatus = rs.getString("status");
@@ -688,7 +760,7 @@ public class TaskQueueRepository {
                                         rs.getString("step_key"),
                                         rs.getLong("step_ordinal"),
                                         rs.getString("idempotency_key"),
-                                        rs.getInt("attempt"));
+                                        rs.getInt("attempt"), now);
                                 deadLettered++;
                             } else {
                                 rescheduled++;
@@ -711,10 +783,11 @@ public class TaskQueueRepository {
             String stepKey,
             long stepOrdinal,
             String idempotencyKey,
-            int attempt
+            int attempt,
+            Instant now
     ) throws SQLException {
         String reasonJson = "{\"error\":\"LEASE_ATTEMPTS_EXHAUSTED\",\"attempt\":" + attempt + "}";
-        if (updateWorkflowTerminalInTransaction(conn, workflowId, "FAILED", reasonJson)) {
+        if (updateWorkflowTerminalInTransaction(conn, workflowId, "FAILED", reasonJson, now)) {
             appendEventInTransaction(conn, workflowId, stepKey, "STEP_FAILED", reasonJson, stepOrdinal, idempotencyKey);
             appendEventInTransaction(conn, workflowId, "__workflow__", "WORKFLOW_FAILED", reasonJson);
         }
@@ -761,15 +834,18 @@ public class TaskQueueRepository {
      * Seeds a simulated exhausted task directly into DEAD_LETTER state for Control Plane testing.
      */
     public void seedDeadLetterTask(String workflowId, String stepKey) throws SQLException {
+        Instant now = clock.instant();
+        String idempotencyKey = StepContext.idempotencyKey(workflowId, 0, stepKey);
         if (isH2) {
             String updateSql = """
                 UPDATE workflow_tasks
-                SET status = 'DEAD_LETTER', attempt = 5, worker_id = NULL, lease_expires_at = NULL, next_run_at = NOW()
+                SET status = 'DEAD_LETTER', attempt = 5, worker_id = NULL, lease_expires_at = NULL, next_run_at = ?
                 WHERE workflow_id = ? AND step_key = ?
                 """;
             String insertSql = """
-                INSERT INTO workflow_tasks (workflow_id, step_key, status, attempt, max_attempts, next_run_at)
-                SELECT ?, ?, 'DEAD_LETTER', 5, 5, NOW()
+                INSERT INTO workflow_tasks (workflow_id, step_key, step_ordinal, idempotency_key,
+                                            status, attempt, max_attempts, next_run_at)
+                SELECT ?, ?, 0, ?, 'DEAD_LETTER', 5, 5, ?
                 WHERE NOT EXISTS (SELECT 1 FROM workflow_tasks WHERE workflow_id = ? AND step_key = ?)
                 """;
             try (Connection conn = dataSource.getConnection()) {
@@ -777,16 +853,19 @@ public class TaskQueueRepository {
                 try {
                     int updated;
                     try (PreparedStatement ps = conn.prepareStatement(updateSql)) {
-                        ps.setString(1, workflowId);
-                        ps.setString(2, stepKey);
+                        setInstant(ps, 1, now);
+                        ps.setString(2, workflowId);
+                        ps.setString(3, stepKey);
                         updated = ps.executeUpdate();
                     }
                     if (updated == 0) {
                         try (PreparedStatement ps = conn.prepareStatement(insertSql)) {
                             ps.setString(1, workflowId);
                             ps.setString(2, stepKey);
-                            ps.setString(3, workflowId);
-                            ps.setString(4, stepKey);
+                            ps.setString(3, idempotencyKey);
+                            setInstant(ps, 4, now);
+                            ps.setString(5, workflowId);
+                            ps.setString(6, stepKey);
                             ps.executeUpdate();
                         }
                     }
@@ -800,15 +879,19 @@ public class TaskQueueRepository {
         }
 
         String sql = """
-            INSERT INTO workflow_tasks (workflow_id, step_key, status, attempt, max_attempts, next_run_at)
-            VALUES (?, ?, 'DEAD_LETTER', 5, 5, NOW())
-            ON CONFLICT (workflow_id, step_key)
-            DO UPDATE SET status = 'DEAD_LETTER', attempt = 5, worker_id = NULL, lease_expires_at = NULL
+            INSERT INTO workflow_tasks (workflow_id, step_key, step_ordinal, idempotency_key,
+                                        status, attempt, max_attempts, next_run_at)
+            VALUES (?, ?, 0, ?, 'DEAD_LETTER', 5, 5, ?)
+            ON CONFLICT (workflow_id, step_ordinal)
+            DO UPDATE SET status = 'DEAD_LETTER', attempt = 5, worker_id = NULL,
+                          lease_expires_at = NULL, next_run_at = EXCLUDED.next_run_at
             """;
         try (Connection conn = dataSource.getConnection();
              PreparedStatement ps = conn.prepareStatement(sql)) {
             ps.setString(1, workflowId);
             ps.setString(2, stepKey);
+            ps.setString(3, idempotencyKey);
+            setInstant(ps, 4, now);
             ps.executeUpdate();
         }
     }
@@ -823,11 +906,12 @@ public class TaskQueueRepository {
                 attempt = 0,
                 worker_id = NULL,
                 lease_expires_at = NULL,
-                next_run_at = NOW()
+                next_run_at = ?
             WHERE status = 'DEAD_LETTER'
             """;
         try (Connection conn = dataSource.getConnection();
              PreparedStatement ps = conn.prepareStatement(sql)) {
+            setInstant(ps, 1, clock.instant());
             return ps.executeUpdate();
         }
     }

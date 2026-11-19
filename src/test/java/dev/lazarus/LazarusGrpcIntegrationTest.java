@@ -12,6 +12,7 @@ import dev.lazarus.proto.StartWorkflowRequest;
 import dev.lazarus.proto.StartWorkflowResponse;
 import dev.lazarus.proto.WorkflowOrchestratorServiceGrpc;
 import dev.lazarus.store.EventStoreRepository;
+import dev.lazarus.workflow.PaymentSagaWorkflow;
 import io.grpc.ManagedChannel;
 import io.grpc.ManagedChannelBuilder;
 import io.grpc.Status;
@@ -108,6 +109,7 @@ class LazarusGrpcIntegrationTest {
 
     @Test
     void unknownWorkflowTypeIsRejected() {
+        assertTrue(definitions.find(PaymentSagaWorkflow.WORKFLOW_TYPE).isPresent());
         StatusRuntimeException error = assertThrows(StatusRuntimeException.class, () ->
                 stub.startWorkflow(StartWorkflowRequest.newBuilder()
                         .setWorkflowId("it-unknown-" + UUID.randomUUID())

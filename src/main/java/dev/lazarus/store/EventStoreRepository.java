@@ -4,7 +4,11 @@ import dev.lazarus.workflow.StepContext;
 
 import javax.sql.DataSource;
 import java.sql.*;
+import java.time.Clock;
 import java.time.Instant;
+import java.time.OffsetDateTime;
+import java.time.ZoneOffset;
+import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -36,10 +40,20 @@ public class EventStoreRepository {
 
     private final DataSource dataSource;
     private final boolean isH2;
+    private final Clock clock;
 
     public EventStoreRepository(DataSource dataSource) {
+        this(dataSource, Clock.systemUTC());
+    }
+
+    public EventStoreRepository(DataSource dataSource, Clock clock) {
         this.dataSource = dataSource;
+        this.clock = clock;
         this.isH2 = checkIsH2(dataSource);
+    }
+
+    private static void setInstant(PreparedStatement ps, int index, Instant instant) throws SQLException {
+        ps.setObject(index, OffsetDateTime.ofInstant(instant.truncatedTo(ChronoUnit.MICROS), ZoneOffset.UTC));
     }
 
     private static boolean checkIsH2(DataSource ds) {
@@ -53,29 +67,36 @@ public class EventStoreRepository {
     /** Registers a new workflow instance idempotently and records versioned start history. */
     public boolean createWorkflowInstance(String workflowId, String workflowType, String inputJson) throws SQLException {
         String instanceSql = isH2 ? """
-            INSERT INTO workflow_instances (workflow_id, workflow_type, status, input_payload, current_version, workflow_version)
-            SELECT ?, ?, 'RUNNING', ? FORMAT JSON, 1, 1
+            INSERT INTO workflow_instances (workflow_id, workflow_type, status, input_payload, current_version,
+                                            workflow_version, created_at, updated_at)
+            SELECT ?, ?, 'RUNNING', ? FORMAT JSON, 1, 1, ?, ?
             WHERE NOT EXISTS (SELECT 1 FROM workflow_instances WHERE workflow_id = ?)
             """ : """
-            INSERT INTO workflow_instances (workflow_id, workflow_type, status, input_payload, current_version, workflow_version)
-            VALUES (?, ?, 'RUNNING', ?::jsonb, 1, 1)
+            INSERT INTO workflow_instances (workflow_id, workflow_type, status, input_payload, current_version,
+                                            workflow_version, created_at, updated_at)
+            VALUES (?, ?, 'RUNNING', ?::jsonb, 1, 1, ?, ?)
             ON CONFLICT (workflow_id) DO NOTHING
             """;
         String eventSql = isH2 ? """
-            INSERT INTO workflow_events (workflow_id, sequence_num, step_key, event_type, payload, workflow_version)
-            VALUES (?, 1, '__workflow__', 'WORKFLOW_STARTED', ? FORMAT JSON, 1)
+            INSERT INTO workflow_events (workflow_id, sequence_num, step_key, event_type, payload,
+                                         workflow_version, created_at)
+            VALUES (?, 1, '__workflow__', 'WORKFLOW_STARTED', ? FORMAT JSON, 1, ?)
             """ : """
-            INSERT INTO workflow_events (workflow_id, sequence_num, step_key, event_type, payload, workflow_version)
-            VALUES (?, 1, '__workflow__', 'WORKFLOW_STARTED', ?::jsonb, 1)
+            INSERT INTO workflow_events (workflow_id, sequence_num, step_key, event_type, payload,
+                                         workflow_version, created_at)
+            VALUES (?, 1, '__workflow__', 'WORKFLOW_STARTED', ?::jsonb, 1, ?)
             """;
 
         try (Connection conn = dataSource.getConnection()) {
             conn.setAutoCommit(false);
+            Instant now = clock.instant();
             try (PreparedStatement ps = conn.prepareStatement(instanceSql)) {
                 ps.setString(1, workflowId);
                 ps.setString(2, workflowType);
                 ps.setString(3, inputJson);
-                if (isH2) ps.setString(4, workflowId);
+                setInstant(ps, 4, now);
+                setInstant(ps, 5, now);
+                if (isH2) ps.setString(6, workflowId);
                 int inserted = ps.executeUpdate();
                 if (inserted == 0) {
                     conn.rollback();
@@ -84,6 +105,7 @@ public class EventStoreRepository {
                 try (PreparedStatement eventPs = conn.prepareStatement(eventSql)) {
                     eventPs.setString(1, workflowId);
                     eventPs.setString(2, inputJson);
+                    setInstant(eventPs, 3, now);
                     eventPs.executeUpdate();
                 }
                 conn.commit();
@@ -203,6 +225,7 @@ public class EventStoreRepository {
         try (Connection conn = dataSource.getConnection()) {
             conn.setAutoCommit(false);
             try {
+                Instant now = clock.instant();
                 long sequence;
                 int workflowVersion;
                 if (isH2) {
@@ -216,16 +239,18 @@ public class EventStoreRepository {
                         }
                     }
                     try (PreparedStatement ps = conn.prepareStatement(
-                            "UPDATE workflow_instances SET current_version = current_version + 1, updated_at = NOW() WHERE workflow_id = ?")) {
-                        ps.setString(1, workflowId);
+                            "UPDATE workflow_instances SET current_version = current_version + 1, updated_at = ? WHERE workflow_id = ?")) {
+                        setInstant(ps, 1, now);
+                        ps.setString(2, workflowId);
                         ps.executeUpdate();
                     }
                 } else {
                     try (PreparedStatement ps = conn.prepareStatement("""
-                            UPDATE workflow_instances SET current_version = current_version + 1, updated_at = NOW()
+                            UPDATE workflow_instances SET current_version = current_version + 1, updated_at = ?
                             WHERE workflow_id = ? RETURNING current_version, workflow_version
                             """)) {
-                        ps.setString(1, workflowId);
+                        setInstant(ps, 1, now);
+                        ps.setString(2, workflowId);
                         try (ResultSet rs = ps.executeQuery()) {
                             if (!rs.next()) throw new IllegalStateException("Workflow instance not found: " + workflowId);
                             sequence = rs.getLong(1);
@@ -234,7 +259,7 @@ public class EventStoreRepository {
                     }
                 }
                 insertEvent(conn, workflowId, sequence, stepKey, eventType, payloadJson,
-                        stepOrdinal, idempotencyKey, workflowVersion);
+                        stepOrdinal, idempotencyKey, workflowVersion, now);
                 conn.commit();
                 return sequence;
             } catch (SQLException | RuntimeException ex) {
@@ -246,12 +271,13 @@ public class EventStoreRepository {
 
     /** Records local workflow terminal state and its event atomically. */
     public void recordWorkflowTerminal(String workflowId, String status, String payloadJson) throws SQLException {
-        if (!"COMPLETED".equals(status) && !"FAILED".equals(status)) {
+        if (!"COMPLETED".equals(status) && !"FAILED".equals(status) && !"COMPENSATED".equals(status)) {
             throw new IllegalArgumentException("Unsupported terminal workflow status: " + status);
         }
         try (Connection conn = dataSource.getConnection()) {
             conn.setAutoCommit(false);
             try {
+                Instant now = clock.instant();
                 long sequence;
                 int version;
                 if (isH2) {
@@ -266,22 +292,24 @@ public class EventStoreRepository {
                     }
                     try (PreparedStatement ps = conn.prepareStatement("""
                             UPDATE workflow_instances SET current_version = current_version + 1, status = ?,
-                                output_payload = ? FORMAT JSON, updated_at = NOW() WHERE workflow_id = ?
+                                output_payload = ? FORMAT JSON, updated_at = ? WHERE workflow_id = ?
                             """)) {
                         ps.setString(1, status);
                         ps.setString(2, payloadJson);
-                        ps.setString(3, workflowId);
+                        setInstant(ps, 3, now);
+                        ps.setString(4, workflowId);
                         ps.executeUpdate();
                     }
                 } else {
                     try (PreparedStatement ps = conn.prepareStatement("""
                             UPDATE workflow_instances SET current_version = current_version + 1, status = ?,
-                                output_payload = ?::jsonb, updated_at = NOW()
+                                output_payload = ?::jsonb, updated_at = ?
                             WHERE workflow_id = ? RETURNING current_version, workflow_version
                             """)) {
                         ps.setString(1, status);
                         ps.setString(2, payloadJson);
-                        ps.setString(3, workflowId);
+                        setInstant(ps, 3, now);
+                        ps.setString(4, workflowId);
                         try (ResultSet rs = ps.executeQuery()) {
                             if (!rs.next()) throw new IllegalStateException("Workflow instance not found: " + workflowId);
                             sequence = rs.getLong(1);
@@ -290,7 +318,7 @@ public class EventStoreRepository {
                     }
                 }
                 insertEvent(conn, workflowId, sequence, "__workflow__", "WORKFLOW_" + status,
-                        payloadJson, null, null, version);
+                        payloadJson, null, null, version, now);
                 conn.commit();
             } catch (SQLException | RuntimeException ex) {
                 conn.rollback();
@@ -300,15 +328,16 @@ public class EventStoreRepository {
     }
 
     private void insertEvent(Connection conn, String workflowId, long sequence, String stepKey, String eventType,
-                             String payloadJson, Long stepOrdinal, String idempotencyKey, int workflowVersion) throws SQLException {
+                             String payloadJson, Long stepOrdinal, String idempotencyKey, int workflowVersion,
+                             Instant createdAt) throws SQLException {
         String sql = isH2 ? """
             INSERT INTO workflow_events (workflow_id, sequence_num, step_key, event_type, payload,
-                                         step_ordinal, idempotency_key, workflow_version)
-            VALUES (?, ?, ?, ?, ? FORMAT JSON, ?, ?, ?)
+                                         step_ordinal, idempotency_key, workflow_version, created_at)
+            VALUES (?, ?, ?, ?, ? FORMAT JSON, ?, ?, ?, ?)
             """ : """
             INSERT INTO workflow_events (workflow_id, sequence_num, step_key, event_type, payload,
-                                         step_ordinal, idempotency_key, workflow_version)
-            VALUES (?, ?, ?, ?, ?::jsonb, ?, ?, ?)
+                                         step_ordinal, idempotency_key, workflow_version, created_at)
+            VALUES (?, ?, ?, ?, ?::jsonb, ?, ?, ?, ?)
             """;
         try (PreparedStatement ps = conn.prepareStatement(sql)) {
             ps.setString(1, workflowId);
@@ -319,6 +348,7 @@ public class EventStoreRepository {
             if (stepOrdinal == null) ps.setNull(6, Types.BIGINT); else ps.setLong(6, stepOrdinal);
             ps.setString(7, idempotencyKey);
             ps.setInt(8, workflowVersion);
+            setInstant(ps, 9, createdAt);
             ps.executeUpdate();
         }
     }

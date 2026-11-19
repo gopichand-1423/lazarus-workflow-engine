@@ -27,6 +27,7 @@ public class WorkflowContext {
         private final String idempotencyKey;
         private String completedPayloadJson;
         private long completedSequence;
+        private String failedPayloadJson;
 
         private StepHistory(String stepKey, String idempotencyKey) {
             this.stepKey = stepKey;
@@ -39,6 +40,7 @@ public class WorkflowContext {
     private final ObjectMapper mapper;
     private final Map<Long, StepHistory> historyByOrdinal;
     private final AtomicLong nextStepOrdinal = new AtomicLong();
+    private volatile String successfulTerminalStatus = "COMPLETED";
 
     public WorkflowContext(String workflowId, EventStoreRepository eventStore, ObjectMapper mapper) throws Exception {
         this.workflowId = workflowId;
@@ -63,6 +65,8 @@ public class WorkflowContext {
             if ("STEP_COMPLETED".equals(event.eventType())) {
                 history.completedPayloadJson = event.payloadJson();
                 history.completedSequence = event.sequenceNum();
+            } else if ("STEP_FAILED".equals(event.eventType())) {
+                history.failedPayloadJson = event.payloadJson();
             }
         }
     }
@@ -75,6 +79,43 @@ public class WorkflowContext {
     /** Executes or replays a step, exposing a stable idempotency key to external activity code. */
     public <T> T step(String stepKey, Class<T> returnType, StepActivity<T> action) throws Exception {
         return executeAt(nextStepOrdinal.getAndIncrement(), stepKey, returnType, action);
+    }
+
+    /** Marks a returned workflow result as successfully compensated instead of normally completed. */
+    public void markCompensated() {
+        successfulTerminalStatus = "COMPENSATED";
+    }
+
+    public String successfulTerminalStatus() {
+        return successfulTerminalStatus;
+    }
+
+    public boolean hasRecordedStep(String stepKey) {
+        return historyByOrdinal.values().stream().anyMatch(history -> history.stepKey.equals(stepKey));
+    }
+
+    /** Replays a previously handled failure without re-invoking a now-transient activity. */
+    public void replayRecordedFailure(String stepKey) throws Exception {
+        long ordinal = nextStepOrdinal.getAndIncrement();
+        StepHistory history = historyByOrdinal.get(ordinal);
+        if (history == null) {
+            throw new IllegalStateException("No recorded step history at ordinal " + ordinal + " for " + stepKey);
+        }
+        if (!history.stepKey.equals(stepKey)) {
+            throw new NonDeterministicWorkflowException(workflowId, ordinal, history.stepKey, stepKey);
+        }
+        if (history.failedPayloadJson == null || history.completedPayloadJson != null) {
+            throw new IllegalStateException("No replayable failure recorded at ordinal " + ordinal + " for " + stepKey);
+        }
+        String reason = mapper.readTree(history.failedPayloadJson).path("error").asText("STEP_ERROR");
+        throw new RecordedStepFailureException(workflowId, ordinal, stepKey, reason);
+    }
+
+    public static final class RecordedStepFailureException extends Exception {
+        public RecordedStepFailureException(String workflowId, long stepOrdinal, String stepKey, String reason) {
+            super("Recorded step failure in workflow " + workflowId + " at ordinal " + stepOrdinal
+                    + " for " + stepKey + ": " + reason);
+        }
     }
 
     private <T> T executeAt(long ordinal, String stepKey, Class<T> returnType, StepActivity<T> action) throws Exception {
